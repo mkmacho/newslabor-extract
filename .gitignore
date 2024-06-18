@@ -1,3 +1,2 @@
 .DS_Store
-pipeline/
-auxiliary_files/
+**/__pycache__/

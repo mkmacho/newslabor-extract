@@ -1,0 +1,9 @@
+pandas==1.5.3
+spacy==3.7.4
+thefuzz==0.22.1
+nltk==3.8.1
+pyzipcode==3.0.1
+symspellpy==6.7.7
+requests==2.31.0
+numpy==1.26.1
+pyarrow==16.0.0

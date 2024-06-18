@@ -33,11 +33,6 @@ def _wage_candidate_array(tokens, start, end, prefix=True):
     if prefix and "hours" in candidate_arr: 
         return None # signifies schedule, not wage
     if len(candidate_arr) == 1: # If all stop words minus wage
-        # print(tokens)
-        # print(tokens[start:end])
-        # print(tokens[start])
-        # print(tokens[end-1])
-        # print(candidate_arr)
         assert candidate_arr[0] == tokens[start if prefix else end-1]
         return None
     if prefix and candidate_arr[1] in ['dollars', 'cash'] and end+1 <= len(tokens):
@@ -113,6 +108,7 @@ class TextWrapper(object):
                 self._is_word(token) or token.isdigit() or token.lower() in self.CARDINAL_DIRECTIONS)]
 
     def extract_pos_employer(self, text):
+        ''' TODO: find employer names from text. '''
         employers = []
         # orgs_nlp = [ent.text for ent in nlp_large(text).ents if ent.label_ == 'ORG'] 
         # orgs_wiki = [ent.text for ent in nlp_wiki(text).ents if ent.label_ == 'ORG' and not 
@@ -121,7 +117,7 @@ class TextWrapper(object):
         return employers
 
     def format_wage_from_number_words(self, tokens:list, idx:int):
-        # TODO: turn words, e.g. 'one hundred a week' into output
+        ''' TODO: turn words, e.g. 'one hundred a week' into output. '''
         # from word2number import w2n
         return None
 
@@ -172,27 +168,6 @@ class TextWrapper(object):
         if '$' in tokens[idx]: 
             weak_candidate = weak_candidate or tokens[idx]
         return best_candidate, potential_candidate, weak_candidate
-
-    # DEPRECATED
-    def clean_for_wage_old(self, text:str):
-        punct = text.translate(str.maketrans('', '', '!"#%&\'()*+,/:;<>?@[\\]^_`{|}~'))
-        # d = re.sub('(?<=\s\d)\s+(?=\d+\s)', '', punct)
-        # d = re.sub('(?<=\s\d\d)\s+(?=\d+\s)', '', d)
-        # d = re.sub('(?<=\s\d\d\d)\s+(?=\d+\s)', '', d)
-        # Digits
-        d = re.sub('([\s|s|t|f|F|S]\d+)\s+(\d+)',r'\1\2', punct)
-        x = re.sub('(\d)\s?(\.)\s?(\d)', r'\1\2\3', d)
-        x = re.sub('(\d+)[\.|,](\d\d\d) ', r'\1\2 ', x) 
-        # Decimals
-        # x = re.sub('(\d)\s?,\s?(\d)', r'\1\2', x)
-        x = re.sub('( |-|^)[s|S|t|f|F|\$][\s+]?(\d+)', r'\1$\2', x)
-        x = re.sub('(\d)[\s+]?[s|S|t|f|F|\$][ |^]', r'\1$ ', x)
-        # Dollars
-        # rhs = re.sub('( \$)\s+(\d)', r'\1\2', x)
-        # lhs = re.sub('(\d)\s+(\$ )', r'\1\2', rhs)
-        punct = re.sub('\s\.\s|\.\s|\s\.', ' ', x).strip()
-        punct = re.sub('\s-\s|\s-|-\s', '-', punct)
-        return self._correct_sentence(punct.lower(), ignore_non_words=True)
 
     def clean_for_wage(self, text:str):
         # Addl spaces
