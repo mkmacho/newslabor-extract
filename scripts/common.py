@@ -3,7 +3,6 @@ import re
 import pandas as pd
 from statistics import mode
 from pyzipcode import ZipCodeDatabase
-from nltk import ConditionalFreqDist, pos_tag, word_tokenize
 from symspellpy import SymSpell
 # from jamspell import TSpellCorrector
 from thefuzz import process, fuzz
@@ -22,14 +21,48 @@ def add_filepath_suffix(dirpath:str, newspaper:str, suffix:str='extract', n:int=
 def time_now(tz:str='America/New_York'):
     return datetime.now(timezone(tz)).strftime("%m/%d/%Y %H:%M:%S")
 
+def newspaper_from_path(filepath:str):
+    ''' Newspaper abbreviation from a data filename.
+
+    Handles both plain inputs ("NJG.csv") and derived ones
+    ("NJG-extract-all.gzip"). Splitting on '-' alone left the extension attached
+    for un-suffixed names, so a CSV template never matched its batch files.
+    '''
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    return stem.split('-')[0]
+
+# Token separating concatenated advertisements inside one `raw_content` blob.
+# It is stored WITHOUT a newspaper prefix ("._classifiedad_19791130_1"), and is a
+# substring of any prefixed form, so splitting on it works for every paper.
+# Splitting on "{newspaper}_classifiedad_" instead matched nothing at all in the
+# NJG data (0 of 10,994 rows), so the address path silently scanned whole blobs.
+AD_SEPARATOR = '_classifiedad_'
+
+def first_ad(text:str):
+    ''' Keep only the first advertisement of a concatenated blob.
+
+    The separator is fused to the preceding token, so the first segment keeps a
+    trailing fragment of that token; that is harmless for tokenised matching and
+    is how the original wage path already behaved.
+    '''
+    return text.split(AD_SEPARATOR)[0] if text else text
+
 def first_digit(word:str):
     for ch in word: 
         if ch.isdigit(): return ch
     return None
 
+# Stop words that carry rate information. "a"/"an" are only kept when scanning
+# *forward* from the amount, where RATES_DOUBLE ("a week", "an hour") is matched;
+# keeping them in the backward scan only injected stray tokens into the emitted
+# string (e.g. "salary $12,307 a 858").
+RATE_STOP_WORDS = set(["per", "every"])
+RATE_STOP_WORDS_PREFIX = RATE_STOP_WORDS | set(["a", "an"])
+
 def _wage_candidate_array(tokens, start, end, prefix=True):
+    keep = RATE_STOP_WORDS_PREFIX if prefix else RATE_STOP_WORDS
     candidate_arr = [token.lower() for token in tokens[start:end] if \
-        token.lower() not in (STOP_WORDS - set(["per", "every"]))]
+        token.lower() not in (STOP_WORDS - keep)]
     if prefix and "hours" in candidate_arr: 
         return None # signifies schedule, not wage
     if len(candidate_arr) == 1: # If all stop words minus wage
@@ -43,16 +76,32 @@ def _wage_candidate_array(tokens, start, end, prefix=True):
 class TextWrapper(object):
     def __init__(self, dictionary_filepath):
         self.checker = SymSpell()
-        self.checker.load_dictionary(dictionary_filepath, 0, 1)
-        assert self.checker, "SymSpell not loaded."
+        loaded = self.checker.load_dictionary(dictionary_filepath, 0, 1)
+        assert loaded, "SymSpell dictionary not loaded from '{}'.".format(
+            dictionary_filepath)
         self.dictionary = self.checker.words
+        assert self.dictionary, "SymSpell dictionary loaded but empty."
         self.CARDINAL_DIRECTIONS = ["east","e","west","w","north","n","south","s"]
         self.REAL_ESTATE = ["decorated","refurbish","remodel","bedroom","bathroom", 
                          "tenant","furniture","deluxe","furnish","apartment",
                          "realtor","realty","garage","backyard","vacant","for sale"]
-        self.STREET_MARKERS_ABBREV = ["rd","blvd","st","ct","ave","av"]
-        self.STREET_MARKERS_FULL = ["road","boulevard","street","circuit","avenue","lane"]
+        self.STREET_MARKERS_ABBREV = ["rd","blvd","st","ct","ave","av","ln","pl"]
+        # NOTE: "dr" is deliberately excluded — it collides with the "Dr." title.
+        self.STREET_MARKERS_FULL = ["road","boulevard","street","circuit","avenue",
+                                    "lane","court","drive","place"]
         self.STREET_MARKERS = self.STREET_MARKERS_ABBREV + self.STREET_MARKERS_FULL
+        # Markers that are common English words or state abbreviations ("ct" is
+        # also Connecticut; "court"/"circuit" appear in courthouse boilerplate).
+        # Measured on NJG, only 4-22% of their matches carry a house number,
+        # against 61-93% for every other marker, so they are accepted only with
+        # one. "circuit" was already in the list and is the worst of them at 5%.
+        self.STREET_MARKERS_NEED_NUMBER = {"ct", "pl", "ln", "court", "place", "circuit"}
+        # Short tokens that must survive clean_tokenize's length filter regardless
+        # of whether they appear in the English dictionary. Without this, markers
+        # like "rd"/"ct" (absent from dictionary_list.txt) were deleted before
+        # STREET_MARKERS was ever consulted. State abbreviations are added by
+        # set_state_abbreviations() once the US state table is available.
+        self.SHORT_KEEP = set(self.STREET_MARKERS_ABBREV) | set(self.CARDINAL_DIRECTIONS)
         self.NUMBERS_SUFFIX = {"1":"st", "2":"nd", "3":"rd"}
         self.WAGE_MARKERS = {"salary","sal","pays","pay","payment","rate","start",
                                 "starting","earn","begins","beginning"}
@@ -85,12 +134,24 @@ class TextWrapper(object):
                     max_edit_distance=edit_dist, ignore_non_words=ignore_non_words,
                     ignore_term_with_digits=ignore_non_words)[0].term
 
+    def set_state_abbreviations(self, state_ids):
+        ''' Register US state abbreviations as short tokens worth keeping.
+
+        Two-letter abbreviations such as "tx", "md", "dc" are absent from the
+        English dictionary and were otherwise dropped by clean_tokenize, making
+        abbreviation-based state detection unreachable for those states.
+        '''
+        self.SHORT_KEEP |= {str(sid).lower() for sid in state_ids}
+        return self
+
     def _is_word(self, word:str):
         return word.lower() in self.dictionary or word.title() in self.dictionary
 
     def potential_salary(self, word:str):
-        if not re.findall('^\$?\d+\.?\d{1,2}?\$?[-\s]', word + " "):
-            return False       
+        # Decimal part is a single optional group: a bare '\d{1,2}?' still
+        # requires one digit, which rejected all single-digit wages ("$8 a day").
+        if not re.findall('^\$?\d+(?:[.,]\d{1,2})?\$?[-\s]', word + " "):
+            return False
         if first_digit(word) == '0': 
             return False
         if re.findall('\d{0,3}-?\s?\d{3}-?\s?\d{4}', word): 
@@ -101,11 +162,11 @@ class TextWrapper(object):
         ''' Basic ad text cleaning. Firstly ensures that we consider only
         first ad, then removes punctuation and extra whitespace. 
         '''
-        first = text.split("{}_classifiedad_".format(newspaper))[0]
+        first = first_ad(text)
         if exclude_RE and any(re in first for re in self.REAL_ESTATE): return None
         cleaned = re.sub(' +', ' ', re.sub(r'[^\w\s]', ' ', first)).strip().split()
-        return [token for token in cleaned if (len(token) >= min_token_length or 
-                self._is_word(token) or token.isdigit() or token.lower() in self.CARDINAL_DIRECTIONS)]
+        return [token for token in cleaned if (len(token) >= min_token_length or
+                self._is_word(token) or token.isdigit() or token.lower() in self.SHORT_KEEP)]
 
     def extract_pos_employer(self, text):
         ''' TODO: find employer names from text. '''
@@ -153,21 +214,72 @@ class TextWrapper(object):
             if candidate_arr[0] in self.WAGE_MARKERS:
                 potential = candidate
                 if idx+2 < len(tokens):
-                    if any(tokens[idx+2] in time for time in self.TIMES) or \
-                        tokens[idx+2] in self.TIMES_ABBREV:
+                    if tokens[idx+2] in (self.TIMES | self.TIMES_ABBREV):
                         potential = ' '.join(tokens[i:idx+3])
                 elif idx+1 < len(tokens):
-                    if any(tokens[idx+1] in time for time in self.TIMES) or \
-                        tokens[idx+1] in self.TIMES_ABBREV:
+                    if tokens[idx+1] in (self.TIMES | self.TIMES_ABBREV):
                         potential = ' '.join(tokens[i:idx+2])
-                if '$' in potential or len(candidate_arr) == 2: 
+                # A bare "<marker> <amount>" (no rate, no '$') is only credible
+                # when the amount has two or more digits: allowing single digits
+                # here promotes noise like "pay 1" / "salary 2" to an output wage.
+                marker_and_amount = len(candidate_arr) == 2 and \
+                    sum(ch.isdigit() for ch in tokens[idx]) > 1
+                if '$' in potential or marker_and_amount:
                     potential_candidate = potential_candidate or potential
-                else: 
+                else:
                     weak_candidate = weak_candidate or potential
         # Finally, if have dollar wage consider (weak)
         if '$' in tokens[idx]: 
             weak_candidate = weak_candidate or tokens[idx]
         return best_candidate, potential_candidate, weak_candidate
+
+    # Rate words -> the period the amount is quoted per. Used by parse_wage.
+    WAGE_PERIODS = {
+        'hour':'hour', 'hr':'hour', 'hourly':'hour',
+        'day':'day', 'daily':'day',
+        'week':'week', 'wk':'week', 'weekly':'week',
+        'month':'month', 'mo':'month', 'monthly':'month',
+        'year':'year', 'yr':'year', 'yearly':'year', 'annually':'year', 'annum':'year',
+    }
+
+    def parse_wage(self, wage:str):
+        ''' Split an extracted wage string into (amount, period, is_range).
+
+        The pipeline emits strings such as "$60 per hour"; analysis needs a
+        number and a period. Returns None for amount and/or period when the
+        string does not carry them, rather than guessing.
+
+        `amount` is the FIRST number in the string (the low end of a range).
+
+        `is_range` requires an explicit range separator as well as a second
+        number: OCR routinely splits one amount into two tokens ("$9 75 hour" is
+        $9.75, not a range), and keying only on "more than one number" made 63%
+        of the flags false positives on real output.
+
+        `wage_n_amounts` exposes how many numbers were seen, so a caller can
+        exclude ambiguous strings without re-parsing. Amounts are unreliable
+        where OCR split a thousands group; see AUDIT.md for the measured rate.
+        '''
+        out = {'wage_amount':None, 'wage_period':None, 'wage_is_range':False,
+               'wage_n_amounts':0}
+        if not wage or not isinstance(wage, str):
+            return out
+        text = wage.lower()
+        # Amounts: allow thousands separators and decimals.
+        amounts = re.findall(r'\d+(?:,\d{3})*(?:\.\d+)?', text)
+        if amounts:
+            try:
+                out['wage_amount'] = float(amounts[0].replace(',', ''))
+            except ValueError:
+                out['wage_amount'] = None
+            out['wage_n_amounts'] = len(amounts)
+            out['wage_is_range'] = len(amounts) > 1 and bool(
+                re.search(r'\d\s*(?:-|–|to\b)\s*\$?\d', text))
+        for token in re.findall(r'[a-z]+', text):
+            if token in self.WAGE_PERIODS:
+                out['wage_period'] = self.WAGE_PERIODS[token]
+                break
+        return out
 
     def clean_for_wage(self, text:str):
         # Addl spaces
@@ -239,31 +351,25 @@ class TextWrapper(object):
     def find_street_markers(self, text:str, short_thresh:int=100, long_thresh:int=80):
         ''' Identifies possible street markers. '''
         street_tokens = []
-        matches = process.extract(text, STREET_MARKERS_FULL, scorer=fuzz.partial_ratio)
+        matches = process.extract(text, self.STREET_MARKERS_FULL, scorer=fuzz.partial_ratio)
         for match in matches:
             if match[1] >= long_thresh:
                 street_tokens.append(match[0])
-        matches = process.extract(text, STREET_MARKERS_ABBREV, scorer=fuzz.token_set_ratio)
+        matches = process.extract(text, self.STREET_MARKERS_ABBREV, scorer=fuzz.token_set_ratio)
         for match in matches:
             if match[1] >= short_thresh:
                 street_tokens.append(match[0])
         return street_tokens 
 
-    def find_tags(self, tag_prefix:str, tagged_text:list):
-        ''' Find tokens matching the specified tag_prefix. '''
-        cfd = ConditionalFreqDist((tag, word) for (word, tag) in tagged_text
-                                      if tag.startswith(tag_prefix))
-        return dict((tag, list(cfd[tag].keys())) for tag in cfd.conditions())
-
 
 class USGeoData(object):
-    def __init__(self, states_fp, cities_fp, nearby_fp):
+    def __init__(self, states_fp, cities_fp, nearby_fp, zips_fp=None):
         # Database of US states and state abbreviations
         self.US_STATES = pd.read_csv(states_fp).rename(
             {"State":"state_name","Abbreviation":"state_id"}, axis='columns')
         # Database of US cities and city-level information from SimpleMaps
-        self.US_CITIES = pd.read_csv(cities_fp)[
-            ['city','state_id','state_name','county_name','zips','population']
+        self.US_CITIES = pd.read_csv(cities_fp, dtype={'county_fips':str})[
+            ['city','state_id','state_name','county_name','county_fips','zips','population']
         ]
         self.US_CITIES.zips = self.US_CITIES.zips.fillna('')
         # Neighboring state IDs mapping
@@ -273,31 +379,106 @@ class USGeoData(object):
             "BoG":"MA","ChT":"IL","HaC":"CT","LAS":"CA","LAT":"CA","NJG":"VA",
             "NYr":"NY","NYT":"NY","WaP":"DC"}
         self.ZIPCODE_DB = ZipCodeDatabase()
+        # Authoritative zipcode -> county lookup (simplemaps uszips.csv). Falls
+        # back to scanning the city table's `zips` column when not supplied.
+        # Zipcode -> county lookups, built from BOTH shipped sources. uszips.csv
+        # is authoritative but covers only ZCTAs, so it omits PO-box-only codes
+        # that appear in ads (Norfolk's 23501 among them); the city table's `zips`
+        # column carries those. City rows are applied first and uszips overlaid on
+        # top, so the authoritative value wins wherever both have the code.
+        # County FIPS is the joinable key analysis actually needs: county *names*
+        # are not unique nationally (1,910 names span 3,207 name+state pairs).
+        self.ZIP_TO_COUNTY, self.ZIP_TO_FIPS = {}, {}
+        # Where two city rows claim the same zipcode, the MORE SPECIFIC row wins:
+        # rows are written in order of decreasing zip-list length, so the shortest
+        # (most specific) list is applied last. Ranking by population instead let
+        # simplemaps' consolidated "New York" row — population 18.9M, 308 zips,
+        # county recorded as Queens — overwrite 96 Manhattan zipcodes that the
+        # borough's own row labels correctly. Benchmarked against uszips, this
+        # ordering agrees on 95.9% of shared zips versus 95.2% for population.
+        by_specificity = self.US_CITIES.assign(
+            _nzips=self.US_CITIES.zips.fillna('').str.split().apply(len)
+        ).sort_values(['_nzips', 'population'], ascending=[False, True])
+        for row in by_specificity.itertuples():
+            if not isinstance(row.zips, str): continue
+            for z in row.zips.split():
+                self.ZIP_TO_COUNTY[z] = row.county_name
+                if isinstance(row.county_fips, str):
+                    self.ZIP_TO_FIPS[z] = row.county_fips.zfill(5)
+        if zips_fp:
+            uszips = pd.read_csv(zips_fp, usecols=['zip','county_name','county_fips'],
+                dtype={'zip':str, 'county_name':str, 'county_fips':str})
+            zips5 = uszips.zip.str.zfill(5)
+            self.ZIP_TO_COUNTY.update(dict(zip(zips5, uszips.county_name)))
+            have_fips = uszips.county_fips.notna()
+            self.ZIP_TO_FIPS.update(dict(zip(zips5[have_fips],
+                uszips.county_fips[have_fips].str.zfill(5))))
         print("Loaded USA geo-data.")
 
     def load(self, newspaper:str, min_pop=50000):
-        self.state_id = self.NEWSPAPER_TO_STATE_ID[newspaper] 
+        # The compute_* methods are deliberately named apart from the attributes
+        # they fill: assigning results onto the method names made load() a
+        # one-shot operation (a second call raised "'list' object is not callable").
+        self.state_id = self.NEWSPAPER_TO_STATE_ID[newspaper]
         self.state_name = self.state_id_to_state_name(self.state_id)
-        self.nearby_state_ids = self.nearby_state_ids(self.state_id)
+        self.nearby_state_ids = self.compute_nearby_state_ids(self.state_id)
         self.nearby_states = self.nearby_state_names(self.nearby_state_ids)
-        self.biggest_nearby_cities = self.biggest_nearby_cities(
+        self.biggest_nearby_cities = self.compute_biggest_nearby_cities(
             self.nearby_state_ids, min_pop=min_pop)
+        # Deterministic iteration order for fuzzy matching (see above).
+        self.sorted_nearby_cities = sorted(self.biggest_nearby_cities)
         print("Loaded newspaper-state data.")
         return self
 
     def counties_from_zips(self, zipcodes:list):
+        ''' Map each zipcode to its county.
+
+        Returns one county per resolvable zipcode, so that the caller's mode()
+        picks the modal county *across* the observed zipcodes. (Previously this
+        took mode(zipcodes) first — discarding every other zipcode — and then
+        returned the counties of all cities whose zip list contained it.)
+        '''
         if not zipcodes: return None
-        return list(self.US_CITIES.loc[self.US_CITIES.zips.str.contains(
-            mode(zipcodes)), 'county_name'].values) 
+        normalized = [str(z).strip()[:5] for z in zipcodes if z]
+        counties = [self.ZIP_TO_COUNTY[z] for z in normalized
+                    if z in self.ZIP_TO_COUNTY]
+        return counties or None
+
+    def fips_from_zips(self, zipcodes:list):
+        ''' Map each zipcode to its 5-digit county FIPS code.
+
+        Unlike a county name this is a unique, joinable identifier, so it is the
+        column downstream analysis should merge on.
+        '''
+        if not zipcodes or not self.ZIP_TO_FIPS: return None
+        codes = [self.ZIP_TO_FIPS[z] for z in
+                 (str(x).strip()[:5] for x in zipcodes if x)
+                 if z in self.ZIP_TO_FIPS]
+        return codes or None
+
+    # US ZIP codes were introduced on 1 July 1963; a 5-digit match in an earlier
+    # ad is necessarily something else (a price, a lot number, OCR noise).
+    ZIPCODE_INTRODUCED = 1963
 
     def state_id_to_state_name(self, state_id:str):
         assert state_id in self.US_STATES.state_id.to_list()
         return self.US_STATES.state_name[self.US_STATES.state_id == state_id].iloc[0]
 
-    def nearby_state_ids(self, state_id:str):
-        # Adjacent (and home newspaper) state IDs (i.e. abbreviations)
-        return self.NEIGHBOR_STATES.loc[
-            self.NEIGHBOR_STATES.state_id == state_id].neighbor_id.to_list() + [state_id]
+    def compute_nearby_state_ids(self, state_id:str):
+        ''' Adjacent (and home newspaper) state IDs, i.e. abbreviations.
+
+        neighbors-states.csv stores each adjacency ONCE, alphabetically ordered
+        ("DC,MD" but never "MD,DC"), so selecting only rows whose state_id matches
+        returned just the alphabetically-later neighbours: Virginia's neighbours
+        were WV alone, losing DC, KY, MD, NC and TN. Both directions are unioned
+        here so the adjacency is symmetric, as the name and the README imply.
+        '''
+        forward = self.NEIGHBOR_STATES.loc[
+            self.NEIGHBOR_STATES.state_id == state_id].neighbor_id.to_list()
+        reverse = self.NEIGHBOR_STATES.loc[
+            self.NEIGHBOR_STATES.neighbor_id == state_id].state_id.to_list()
+        # sorted() keeps the ordering deterministic across runs
+        return sorted(set(forward) | set(reverse) | {state_id})
 
     def nearby_state_names(self, nearby_state_ids:list):
         return self.US_STATES.loc[
@@ -308,17 +489,26 @@ class USGeoData(object):
             self.US_CITIES.population >= min_pop)].sort_values(
                 by=['population'], ascending=False).city.to_list()
 
-    def biggest_nearby_cities(self, nearby_state_ids:list, min_pop:int=50000):
-        ''' Return list of biggest cities in given states. '''
+    def compute_biggest_nearby_cities(self, nearby_state_ids:list, min_pop:int=50000):
+        ''' Return the set of biggest cities in given states.
+
+        A set is returned for O(1) membership tests, but it must never be
+        *iterated* for matching: set iteration order depends on Python's
+        per-process string hash seed, which made candidate ordering (and hence
+        mode() tie-breaking on the resolved county) vary between runs and
+        between worker processes. Use `sorted_nearby_cities` for iteration.
+        '''
         biggest_cities = []
         for state_id in nearby_state_ids:
-            biggest_cities.extend(self.US_CITIES[(self.US_CITIES.state_id == state_id) & 
+            biggest_cities.extend(self.US_CITIES[(self.US_CITIES.state_id == state_id) &
                     (self.US_CITIES.population >= min_pop)].city.to_list())
         return set(biggest_cities)
 
     def find_nearby_zipcodes(self, text:str, nearby_state_ids:list):
         ''' Matches 5-digit to plausible (nearby-state) zipcodes. '''
-        zips = re.findall(r"\D(\d{5})\D", " " + text + " ")
+        # Lookarounds rather than consuming boundary characters: "23501 23502"
+        # otherwise yielded only the first zipcode.
+        zips = re.findall(r"(?<!\d)(\d{5})(?!\d)", " " + text + " ")
         return [self.ZIPCODE_DB[z] for z in zips if (self.ZIPCODE_DB.get(z) and 
             self.ZIPCODE_DB[z].state in nearby_state_ids)]
 
@@ -360,11 +550,13 @@ class USGeoData(object):
             if token.title() in self.biggest_nearby_cities:
                 matches[token] = {'name':token.title(), 'conf':100}
                 continue
-            # otherwise probable matches
-            cities = process.extract(token.title(), self.biggest_nearby_cities, 
-                scorer=fuzz.ratio, limit=5)
-            for (city, score) in cities:
-                if score < threshold: break
+            # otherwise best probable match (process.extract is sorted best-first;
+            # iterating without breaking used to leave the *lowest* scorer above
+            # the threshold in `matches`)
+            if not self.sorted_nearby_cities: continue
+            (city, score) = process.extractOne(token.title(),
+                self.sorted_nearby_cities, scorer=fuzz.ratio)
+            if score >= threshold:
                 matches[token] = {'name':city, 'conf':score}
         return matches
 
@@ -374,7 +566,7 @@ class USGeoData(object):
         '''
         matches = {}
         for token in tokens_list:
-            assert token, tokens
+            assert token, tokens_list
             # exact (nearby state) matches
             if token.title() in set(self.nearby_states):
                 matches[token.title()] = {'name':token.title(),'conf':100,'type':'name'}
