@@ -145,5 +145,7 @@ if __name__ == "__main__":
     assert os.path.isfile(args.base), 'Invalid --base filepath.'
     assert args.wage is None or os.path.isfile(args.wage), 'Invalid --wage filepath.'
     assert os.path.isdir(args.aux_dir), 'Invalid --aux_dir.'
-    assert os.path.isdir(args.output_dir), 'Invalid --output_dir.'
+    # The output directory is ours to create; asserting on it only
+    # made a first run fail on a path the user never chose.
+    os.makedirs(args.output_dir, exist_ok=True)
     main(args)

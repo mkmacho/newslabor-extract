@@ -179,7 +179,9 @@ if __name__ == "__main__":
 
     assert os.path.isfile(args.filepath), 'Invalid filepath to data.'
     assert os.path.isdir(args.aux_dir), 'Invalid filepath to auxiliary files.'
-    assert os.path.isdir(args.output_dir), 'Invalid filepath to output directory.'
+    # The output directory is ours to create; asserting on it only
+    # made a first run fail on a path the user never chose.
+    os.makedirs(args.output_dir, exist_ok=True)
 
     newspaper = newspaper_from_path(args.filepath)
     US_DATA = USGeoData(
