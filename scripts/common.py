@@ -378,6 +378,20 @@ class USGeoData(object):
         self.NEWSPAPER_TO_STATE_ID = {"ASA":"TX","ATC":"GA","ATL":"GA","BaS":"MD",
             "BoG":"MA","ChT":"IL","HaC":"CT","LAS":"CA","LAT":"CA","NJG":"VA",
             "NYr":"NY","NYT":"NY","WaP":"DC"}
+        # City-name indexes, built once. Both replace repeated full-table scans
+        # in the per-advertisement path; iteration follows the source file so the
+        # emitted candidate order is unchanged.
+        self.CITY_INDEX, self.CITY_STATES = {}, {}
+        for r in self.US_CITIES.itertuples(index=False):
+            self.CITY_INDEX.setdefault(r.city, []).append({
+                'city': r.city, 'state_id': r.state_id, 'state_name': r.state_name,
+                'county_name': r.county_name, 'county_fips': r.county_fips,
+                'zips': r.zips if isinstance(r.zips, str) else '',
+                'population': r.population})
+            states = self.CITY_STATES.setdefault(r.city, [])
+            if r.state_name not in states:
+                states.append(r.state_name)
+
         self.ZIPCODE_DB = ZipCodeDatabase()
         # Authoritative zipcode -> county lookup (simplemaps uszips.csv). Falls
         # back to scanning the city table's `zips` column when not supplied.
@@ -427,6 +441,11 @@ class USGeoData(object):
             self.nearby_state_ids, min_pop=min_pop)
         # Deterministic iteration order for fuzzy matching (see above).
         self.sorted_nearby_cities = sorted(self.biggest_nearby_cities)
+        # Fuzzy matching is the dominant remaining cost once the city lookups are
+        # indexed, and ad vocabulary repeats heavily across a corpus, so results
+        # are memoised per token. Cleared here because the city set it depends on
+        # is rebuilt by every load().
+        self._city_match_memo = {}
         print("Loaded newspaper-state data.")
         return self
 
@@ -513,23 +532,35 @@ class USGeoData(object):
             self.ZIPCODE_DB[z].state in nearby_state_ids)]
 
     def city_objects(self, city:str):
-        return self.US_CITIES[self.US_CITIES.city == city]
+        ''' Rows for a city name, as plain dicts in source-file order.
+
+        Previously `US_CITIES[US_CITIES.city == city]`, a full 31k-row string
+        comparison run several times per advertisement. Profiling the extractor
+        showed those scans (pandas scalar_compare) accounted for 47% of total
+        runtime — more than all the fuzzy matching combined — so the lookup is
+        now an index built once at load.
+        '''
+        return self.CITY_INDEX.get(city, ())
+
+    def states_for_city(self, city:str):
+        ''' State names in which a city name occurs. O(1) index lookup. '''
+        return self.CITY_STATES.get(city, ())
 
     def possible_city_state(self, state_name:str, nearby_states:list, cities_dict_dict:dict, states_dict_dict:dict):
         ''' Return possible city and state of address.
-        If tokens following marker *seem like* potential city or state, include. 
+        If tokens following marker *seem like* potential city or state, include.
         '''
         suffixes = []
         added_city_state = False
         for city_object in cities_dict_dict.values():
             added_city = False
+            city_states = self.states_for_city(city_object['name'])
             for state in nearby_states:
-                if state in self.US_CITIES[
-                        self.US_CITIES.city == city_object['name']].state_name.to_list():
+                if state in city_states:
                     suffixes.append({'city':city_object['name'], 'state':state})
                     added_city = True
                     added_city_state = True
-            if not added_city: 
+            if not added_city:
                 suffixes.append({'city':city_object['name']})
         if not added_city_state:
             for state in list(states_dict_dict.keys()) + [state_name]:
@@ -554,11 +585,30 @@ class USGeoData(object):
             # iterating without breaking used to leave the *lowest* scorer above
             # the threshold in `matches`)
             if not self.sorted_nearby_cities: continue
-            (city, score) = process.extractOne(token.title(),
-                self.sorted_nearby_cities, scorer=fuzz.ratio)
+            (city, score) = self._best_city_match(token.title())
             if score >= threshold:
                 matches[token] = {'name':city, 'conf':score}
         return matches
+
+    # Bounded so a 34M-ad run cannot retain every distinct token; ad vocabulary
+    # is far smaller than this in practice, so the cap is a safety net rather
+    # than a working constraint.
+    CITY_MEMO_MAX = 300000
+
+    def _best_city_match(self, title_token:str):
+        ''' Memoised best fuzzy city match for one token.
+
+        The candidate list is fixed for the loaded newspaper, so the answer
+        depends only on the token — and tokens recur constantly across a corpus.
+        '''
+        hit = self._city_match_memo.get(title_token)
+        if hit is None:
+            hit = process.extractOne(title_token, self.sorted_nearby_cities,
+                scorer=fuzz.ratio)
+            if len(self._city_match_memo) >= self.CITY_MEMO_MAX:
+                self._city_match_memo.clear()
+            self._city_match_memo[title_token] = hit
+        return hit
 
     def check_nearby_states(self, tokens_list:list, name_thresh:int=80, id_thresh:int=90):
         ''' Given list of potential states, return possible true states

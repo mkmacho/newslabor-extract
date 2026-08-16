@@ -9,6 +9,7 @@ Run from the repo root:
 
 No network access: the Geoapify test stubs out the HTTP layer.
 """
+import math
 import os
 import sys
 
@@ -507,7 +508,97 @@ def test_o9_final_coordinates_match_the_chosen_county(us_data):
         "coordinates came from a feature the county selection rejected: %r" % out)
 
 
-def test_o8_suite_cannot_reach_the_network():
+def test_e1_city_index_matches_the_dataframe_scan(us_data):
+    """E1: the prebuilt city index replaced a per-ad full-table pandas scan.
+    It must return exactly what that scan returned, in the same order."""
+    for city in ["Norfolk", "Richmond", "Baltimore", "Nowhere-At-All"]:
+        scan = us_data.US_CITIES[us_data.US_CITIES.city == city]
+        idx = us_data.city_objects(city)
+        assert len(idx) == len(scan), city
+        assert [r["state_name"] for r in idx] == scan.state_name.to_list(), city
+        assert [r["county_name"] for r in idx] == scan.county_name.to_list(), city
+        # states_for_city must agree with the scan, deduplicated in first-seen order
+        expected, seen = [], set()
+        for s in scan.state_name:
+            if s not in seen:
+                seen.add(s)
+                expected.append(s)
+        assert list(us_data.states_for_city(city)) == expected, city
+
+
+def test_e2_memoised_fuzzy_match_is_transparent(us_data_lat):
+    """E2: memoising the per-token city match must not change any answer."""
+    tokens = ["santa clar", "norfok", "los angles", "zzzznotacity", "Pasadena"]
+    us_data_lat._city_match_memo.clear()
+    fresh = [us_data_lat._best_city_match(t.title()) for t in tokens]
+    cached = [us_data_lat._best_city_match(t.title()) for t in tokens]
+    assert fresh == cached, "memo returned different answers on the second call"
+    # and it agrees with calling thefuzz directly
+    from thefuzz import process, fuzz
+    direct = [process.extractOne(t.title(), us_data_lat.sorted_nearby_cities,
+                                 scorer=fuzz.ratio) for t in tokens]
+    assert fresh == direct, "memo diverges from an uncached lookup"
+    # the cap must not be able to grow without bound
+    assert us_data_lat.CITY_MEMO_MAX > 0
+
+
+def test_v1_wilson_interval_behaves_at_the_edges():
+    """V1: the normal approximation gives a zero-width interval at k=0 and k=n,
+    which would understate uncertainty exactly where a small sample is weakest."""
+    import validate
+    p, lo, hi = validate.wilson(0, 20)
+    assert p == 0.0 and lo == 0.0 and hi > 0.15, (p, lo, hi)
+    p, lo, hi = validate.wilson(20, 20)
+    assert p == 1.0 and hi == 1.0 and lo < 0.9, (p, lo, hi)
+    p, lo, hi = validate.wilson(5, 10)
+    assert lo < 0.5 < hi
+    assert all(math.isnan(x) for x in validate.wilson(0, 0))
+
+
+def test_v2_sample_includes_ads_the_pipeline_missed(tmp_path):
+    """V2: a sample drawn only from ads that produced an address cannot contain
+    a false negative, so recall would be unmeasurable. Both sides must appear."""
+    import validate
+    df = pd.DataFrame({
+        'id': range(40),
+        'year': [1930 + (i % 8) * 10 for i in range(40)],
+        'raw_content': ['cook wanted apply 5 Main Street Norfolk'] * 40,
+        'addresses': [[{'street': 'Main Street'}] if i % 2 else [] for i in range(40)],
+        'wage': [None] * 40,
+    })
+    sample = validate.draw_sample(df, 20, seed=1)
+    found = sample.addresses.apply(lambda a: len(a) > 0)
+    assert found.any(), "sample contains no ads with a prediction"
+    assert (~found).any(), "sample contains no empty ads — recall unmeasurable"
+    out = tmp_path / "s.csv"
+    key = validate.write_template(sample, str(out), "NJG")
+    written = pd.read_csv(out, keep_default_na=False)
+    for col in validate.CODING_COLUMNS:
+        assert col in written.columns
+    assert 'ad_text' in written.columns and written.ad_text.str.len().gt(0).all()
+    assert os.path.isfile(key), "codebook not written"
+
+
+def test_v3_scoring_separates_precision_from_recall(capsys):
+    """V3: an emitted-but-wrong address must hurt precision, and a missed
+    address must hurt recall; the two must not be conflated."""
+    import validate
+    df = pd.DataFrame({
+        'year': [1970] * 4,
+        'pred_addresses': ['5 Main St', '', '9 Oak St', ''],
+        'pred_wage': [None] * 4,
+        'truth_has_address': ['y', 'y', 'n', 'n'],
+        'truth_is_job_ad': ['y'] * 4,
+        'truth_address_is_worksite': ['y', '', '', ''],
+        'truth_has_wage': ['n'] * 4,
+        'pred_address_correct': ['y', '', 'n', ''],
+        'pred_wage_correct': [''] * 4,
+    })
+    validate.score(df)
+    out = capsys.readouterr().out
+    # 2 emitted, 1 right -> precision 50%; 2 truly have one, 1 found -> recall 50%
+    assert "precision (strict)" in out and "50.0%" in out
+    assert "recall" in out
     """O8: the autouse fixture in conftest.py must make a real request impossible,
     so running the suite with a live key in the environment cannot spend credit."""
     with pytest.raises(AssertionError, match="never hit the network"):
