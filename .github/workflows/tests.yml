@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main, 'audit/**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.11 is the ceiling: pandas 1.5.3 publishes no wheels above it, and the
+      # pipeline needs 3.9+ for the dict-merge operator in extract.py.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the test suite
+        # The suite makes no network calls — conftest.py replaces the HTTP
+        # session with a stub that raises — so no API key is needed. The dummy
+        # value only satisfies resolve.py's startup check.
+        env:
+          GEOAPIFY_API_KEY: not-a-real-key
+        run: python -m pytest scripts/tests/ -v
+
+      - name: Smoke-test the pipeline end to end
+        # A slice of the bundled sample, proving the CLI and the offline county
+        # derivation work from a clean checkout with no API key. 3,000 rows spans
+        # 1916-1976, so it exercises both sides of the 1963 ZIP-code gate; a
+        # smaller slice is entirely pre-ZIP and would report zero counties.
+        run: |
+          python scripts/extract.py --filepath=./test_data/NJG.csv \
+            -n 3000 --extract_wage=1 --output_dir=./ci-output
+          python scripts/recompute.py --from_addresses \
+            --filepath=./ci-output/NJG-extract-3000.gzip --output_dir=./ci-output
