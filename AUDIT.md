@@ -49,7 +49,7 @@ results.
 | Geography rebuild | SHA-256 values verify the ten audited source files; from those cached bytes the builder reproduces `states.csv`, `uscities.csv`, and `uszips.csv` byte for byte | The GeoNames URL is mutable and its archive is not bundled, so the checksum detects drift but cannot guarantee future retrieval of the audited bytes. |
 | Determinism | Candidate ordering and fuzzy-city lookup are regression-tested across hash seeds | External API results may still change over time. |
 | Validation estimator Monte Carlo | With seed `20260817`, 500 implemented samples of 200 rows across 20 strata pass the stated bias and 0.900 coverage guards in six synthetic patterns; interior-pattern coverage is 0.952–0.986 and boundary coverage is 1.000 | Intervals are approximate Kish-effective-n Wilson intervals on a fixed synthetic population; the check omits finite-population correction, coder error, and coder nonresponse. |
-| Credential persistence | Current request logging redacts the API key and a test pins that behavior | Git history and external logs require separate release-time secret scanning. |
+| Credential persistence | Current request logging redacts the API key and a test pins that behavior | Provider-side credential status and external service logs are outside the test scope. |
 
 The exact commands are in [README.md](README.md). A check counts as verified only
 when its command completes successfully; documentation alone is not verification.
@@ -122,19 +122,33 @@ credible production estimate requires a documented, independently coded sample
 that includes both emitted and missed addresses, design weights, uncertainty, and
 negative cases such as non-job ads.
 
-## Release checks
+## Public release state
 
-Before publishing or linking a release:
+- Public `main` was rewritten from the audited release tree. A post-rewrite scan
+  confirms that all 40 targeted legacy blobs are absent from reachable history.
+- The new workflow passes the full suite on Python 3.10 and 3.11, the dependency
+  advisory scan, and the documented offline demo.
+- Legacy workflow runs `32018739763`, `32017574630`, and `32016708839` were
+  deleted, and their run endpoints no longer resolve.
+- GitHub secret scanning, push protection, vulnerability alerts, and Dependabot
+  security updates are enabled. Optional non-provider secret patterns and token
+  validity checks are not enabled or available for this repository.
 
-1. Run the 73-test suite and offline smoke test from a clean environment.
-2. Scan the complete Git history for credentials, private paths, licensed source
-   text, and removed binary artifacts; rotate any exposed credential before
-   rewriting history.
-3. Confirm that every public data file is either redistributable or explicitly
-   excluded from the project license in [NOTICE](NOTICE).
-4. Confirm collaborator permission for public code, names, project framing, and
-   any statistics derived from non-public data.
-5. Check that CV and profile links resolve to the current repository.
+After this documentation update is published, `main` is to require pull requests,
+the Python 3.10 and 3.11 checks, resolved conversations, and linear history;
+force pushes and branch deletion are blocked. The rule requires zero approving
+reviews.
 
-Passing the software tests does not satisfy the provenance, permission, or
-empirical-validation checks.
+## Remaining external checks
+
+- Direct URLs for legacy commit and blob SHAs still resolve from GitHub's cache.
+  GitHub Support must complete a server-side purge before those cached objects
+  should be treated as unavailable.
+- Collaborator permission and code-ownership authorization remain necessary for
+  public code, names, project framing, and statistics derived from non-public
+  work.
+- Live Geoapify behavior and performance on the licensed production corpus have
+  not been validated by this release audit.
+
+Passing the software and history checks does not resolve those permission or
+external-validation questions.

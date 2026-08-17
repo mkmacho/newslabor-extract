@@ -6,13 +6,13 @@ Research software for extracting candidate employer locations and offered wages
 from noisy OCR of historical newspaper job advertisements.
 
 > [!IMPORTANT]
-> Miguel Camacho Horvitz contributed research software and data engineering to
-> historical job-advertisement research led by Joan Martínez and Ellora
-> Derenoncourt. He is **not a coauthor of the paper**, and this repository is not
-> an official paper replication package. OpenAI Codex and Anthropic Claude were
-> used to assist the 2026 audit, refactoring, testing, and public-release
-> documentation. Miguel reviewed the resulting work and accepts responsibility
-> for what is included here. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
+> I contributed research software and data engineering to historical
+> job-advertisement research led by Joan Martínez and Ellora Derenoncourt. I am
+> **not a coauthor of the paper**, and this repository is not an official paper
+> replication package. I used OpenAI Codex and Anthropic Claude to assist with
+> the 2026 audit, refactoring, testing, and public-release documentation. I
+> reviewed the resulting work and accept responsibility for what is included
+> here. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
 
 The production source collection available during development contained roughly
 34 million ad-level OCR records across thirteen newspapers. That figure describes
