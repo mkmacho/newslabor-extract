@@ -7,6 +7,7 @@ from urllib3.util.retry import Retry
 from requests.exceptions import RequestException, ReadTimeout
 from statistics import mode
 from math import ceil
+from urllib.parse import urlparse
 import argparse
 import pandas as pd
 import os
@@ -32,7 +33,20 @@ _RATE_STATE = {'min_interval':0.0, 'next_time':0.0}
 
 def set_rate_limit(requests_per_second:float):
     ''' Throttle all threads to at most `requests_per_second` API calls. '''
+    if requests_per_second < 0:
+        raise ValueError("requests_per_second must be non-negative")
     _RATE_STATE['min_interval'] = 1.0 / requests_per_second if requests_per_second else 0.0
+
+
+def validate_base_url(url):
+    '''Require an encrypted provider endpoint without embedded credentials.'''
+    parsed = urlparse(url)
+    if (parsed.scheme != 'https' or not parsed.netloc or parsed.username
+            or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError(
+            "Geoapify base URL must be an HTTPS origin without credentials, "
+            "a query, or a fragment.")
+    return url.rstrip('/')
 
 def _throttle():
     if not _RATE_STATE['min_interval']: return
@@ -58,11 +72,11 @@ def get_wrapper(url, timeout=10):
         resp = SESSION.get(url, timeout=timeout)
         output['content'] = resp.json()
     except ReadTimeout as err:
-        output['message'] = str(err) or ""
+        output['message'] = _redact(str(err) or "")
         output['elapsed'] = timeout
         resp = err
     except RequestException as err:
-        output['message'] = str(err) or ""
+        output['message'] = _redact(str(err) or "")
         resp = err
     finally:
         # None (not 404) when no HTTP response came back: a timeout or connection
@@ -73,7 +87,7 @@ def get_wrapper(url, timeout=10):
         })
         try:
             output['elapsed'] = resp.elapsed.total_seconds()
-        except:
+        except (AttributeError, TypeError):
             pass
     return output
 
@@ -86,8 +100,8 @@ def get_wrapper(url, timeout=10):
 def select_nominatum(response, biggest_nearby_cities):
     ''' Reduce a stored Nominatim response to (address, county, zipcode). '''
     counties, zipcodes, address = [], [], None
-    # Nominatim returns a dict (not a list) for error payloads: treat it as no
-    # result rather than asserting, which used to kill the whole worker batch.
+    # Nominatim returns a dict (not a list) for error payloads; treat it as no
+    # result rather than a valid candidate collection.
     if response.get('status_code') == 200 and isinstance(response.get('content'), list):
         for verified in response['content']:
             if not verified.get('address'): continue
@@ -101,32 +115,42 @@ def select_nominatum(response, biggest_nearby_cities):
                 address = verified['display_name']
     return address, mode(counties or [None]), mode(zipcodes or [None])
 
+def select_geoapify_feature(response, biggest_nearby_cities):
+    '''Return the exact highest-confidence qualifying feature properties.'''
+    best, best_conf = None, 0
+    if (response.get('status_code') != 200
+            or not isinstance(response.get('content'), dict)):
+        return None
+    for verified in response['content'].get('features', []):
+        if not verified.get('properties'):
+            continue
+        props = verified['properties']
+        confidence = props.get('rank', {}).get('confidence', 0)
+        if confidence <= 0:
+            continue
+        if props.get('city') not in biggest_nearby_cities:
+            continue
+        if confidence <= best_conf:
+            continue
+        best_conf, best = confidence, props
+    return best
+
+
 def select_geoapify(response, biggest_nearby_cities):
-    ''' Reduce a stored Geoapify response to (address, county, zipcode).
+    '''Reduce a stored Geoapify response to (address, county, zipcode).
 
     Picks the single highest-confidence qualifying feature and reads every field
-    off *that* feature. Assigning each field independently (whenever it happened
-    to be present) dropped counties that only a lower-confidence feature carried
-    and let address/county/postcode come from different features; the original
-    bug was the opposite — the confidence marker never advanced, so the weakest
-    qualifying feature won.
+    off *that* feature, preventing address, county, and postcode values from being
+    combined across candidates.
     '''
     best_county, best_zipcode, address = None, None, None
-    if response.get('status_code') == 200 and isinstance(response.get('content'), dict):
-        best, best_conf = None, 0
-        for verified in response['content'].get('features', []):
-            if not verified.get('properties'): continue
-            props = verified['properties']
-            confidence = props.get('rank', {}).get('confidence', 0)
-            if confidence <= 0: continue
-            if not props.get('city') in biggest_nearby_cities: continue
-            if confidence <= best_conf: continue
-            best_conf, best = confidence, props
-        if best:
-            county = best.get('county')
-            if county: best_county = county.split(' County')[0]
-            best_zipcode = best.get('postcode')
-            address = best.get('formatted')
+    best = select_geoapify_feature(response, biggest_nearby_cities)
+    if best:
+        county = best.get('county')
+        if county:
+            best_county = county.split(' County')[0]
+        best_zipcode = best.get('postcode')
+        address = best.get('formatted')
     return address, best_county, best_zipcode
 
 
@@ -143,7 +167,8 @@ def geoapify_request(query, biggest_nearby_cities, timeout=10):
     return select_geoapify(response, biggest_nearby_cities) + (response,)
 
 def format_str_address(address_fields:dict):
-    assert isinstance(address_fields, dict)
+    if not isinstance(address_fields, dict):
+        raise TypeError("Address fields must be a dictionary.")
     addr_str = ''
     number = address_fields.get('housenumber')
     street = address_fields.get('street')
@@ -161,6 +186,12 @@ def format_str_address(address_fields:dict):
 # distinct query once cuts paid API calls substantially.
 _CACHE_LOCK = threading.Lock()
 _QUERY_CACHE = {}
+# Queries that are currently being fetched.  The cache lookup alone is not
+# enough under ThreadPoolExecutor: several ads can miss simultaneously and all
+# issue the same paid request before the first response is stored.  Followers
+# wait on the leader's event and reuse its result, including transient results
+# that deliberately are not placed in the long-lived cache.
+_INFLIGHT = {}
 # Bounded so a 34M-ad run cannot accumulate every response in memory; entries are
 # evicted oldest-first (dicts preserve insertion order).
 CACHE_MAX_ENTRIES = 200000
@@ -176,20 +207,45 @@ def cached_request(request_func, query, biggest_nearby_cities, timeout=10):
         if key in _QUERY_CACHE:
             _CACHE_HITS[0] += 1
             return _QUERY_CACHE[key]
-    result = request_func(query, biggest_nearby_cities, timeout=timeout)
-    with _CACHE_LOCK:
+
+        flight = _INFLIGHT.get(key)
+        if flight is None:
+            flight = {'event':threading.Event(), 'result':None, 'error':None}
+            _INFLIGHT[key] = flight
+            leader = True
+        else:
+            _CACHE_HITS[0] += 1
+            leader = False
+
+    if not leader:
+        flight['event'].wait()
+        if flight['error'] is not None:
+            raise flight['error']
+        return flight['result']
+
+    try:
+        result = request_func(query, biggest_nearby_cities, timeout=timeout)
         code = result[3].get('status_code')
-        _STATUS_COUNTS[code] = _STATUS_COUNTS.get(code, 0) + 1
-    # Only cache outcomes that a retry would not change: a timeout or 5xx should
-    # be retried for the next ad rather than memoized as a permanent failure.
-    # 401/402/403 are deliberately NOT cached — a key that expires, hits its quota,
-    # or is rotated mid-run would otherwise memoize a permanent negative for every
-    # subsequent query and the job would "succeed" with nothing but nulls.
-    if result[3].get('status_code') in (200, 400, 404):
         with _CACHE_LOCK:
-            _QUERY_CACHE[key] = result
-            while len(_QUERY_CACHE) > CACHE_MAX_ENTRIES:
-                _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
+            _STATUS_COUNTS[code] = _STATUS_COUNTS.get(code, 0) + 1
+            # Only cache outcomes that a retry would not change: a timeout or
+            # 5xx should be retried for the next ad rather than memoized as a
+            # permanent failure. 401/402/403 are deliberately NOT cached.
+            if code in (200, 400, 404):
+                _QUERY_CACHE[key] = result
+                while len(_QUERY_CACHE) > CACHE_MAX_ENTRIES:
+                    _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
+            flight['result'] = result
+            _INFLIGHT.pop(key, None)
+            flight['event'].set()
+    except BaseException as error:
+        # Always release followers, even for an interrupt or a malformed
+        # response.  The exception is not cached, so a later call can retry.
+        with _CACHE_LOCK:
+            flight['error'] = error
+            _INFLIGHT.pop(key, None)
+            flight['event'].set()
+        raise
     return result
 
 def cache_stats():
@@ -227,7 +283,6 @@ def summarize(addresses:list, counties:list, zipcodes:list, US_DATA:object,
 
 
 def resolve(address_dicts_list:list, US_DATA:object, nominatum=False, geoapify=True, verbose=False):
-    st_time = time.time()
     output = {}
 
     if nominatum:
@@ -288,19 +343,41 @@ def multithreading(func, addrs, geo, max_workers:int=None):
     return list(res)
 
 
+def validate_resume(nrows:int, batch_size:int, skip:int):
+    '''Validate that a resolve run resumes only at a checkpoint boundary.'''
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if skip < 0 or skip > nrows:
+        raise ValueError("skip must lie between 0 and the input row count")
+    if skip % batch_size:
+        raise ValueError("skip must be a whole multiple of batch_size")
+
+
+def assign_batch_results(sample, results):
+    '''Attach one resolved batch without retaining duplicate response payloads.'''
+    locations = sample.index.get_indexer(results.index)
+    if (locations < 0).any():
+        raise ValueError("Resolved batch contains row ids outside the input sample.")
+    for column in results.columns:
+        if column not in sample.columns:
+            sample[column] = pd.Series(index=sample.index, dtype='object')
+        sample[column].to_numpy(copy=False)[locations] = results[column].to_numpy()
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--filepath', type=str, required=True, help="Filepath to extract output, e.g. ./output/NJG-extract-all.gzip")
     parser.add_argument('-n', '--nrows', type=int, default=None, help="Maximum number of ads.")
     parser.add_argument('-s', '--skip', type=int, default=0, help="Ads to skip at beginning.")
-    # type=int, not type=bool: bool("0") is True, so '--multithreading=0' used to
-    # silently enable multithreading.
+    # type=int, not type=bool: bool("0") is True.
     parser.add_argument('-m', '--multithreading', type=int, default=0, help="Use multithreads.")
     parser.add_argument('-w', '--nworkers', type=int, default=None, help="Number workers to use.")
     parser.add_argument('-b', '--batch_size', type=int, default=10000, help="Batch size.")
     parser.add_argument('-r', '--rate_limit', type=float, default=0,
         help="Max API requests per second across all threads (0 = unthrottled).")
+    parser.add_argument('--min_pop', type=int, default=USGeoData.DEFAULT_MIN_POP,
+        help="Minimum city population used when building address candidates.")
     parser.add_argument('--min_ok_share', type=float, default=0.05,
         help="Abort if the share of HTTP 200 responses falls below this (0 to disable).")
     parser.add_argument('-u', '--geoapify_url', type=str, default="https://api.geoapify.com",
@@ -309,25 +386,39 @@ if __name__ == "__main__":
         default='./auxiliary_files')
     parser.add_argument('-o', '--output_dir', type=str, help="Filepath to output directory.",
         default='./output')
+    parser.add_argument('--write_csv', type=int, default=0,
+        help="Also write a CSV copy containing source text and response payloads "
+             "(default: disabled).")
     args = parser.parse_args()
 
-    assert os.path.isdir(args.aux_dir), 'Invalid filepath to auxilliary files.'
-    assert os.path.isfile(args.filepath), 'Invalid filepath to data CSV.'
+    if not os.path.isdir(args.aux_dir):
+        parser.error('Invalid filepath to auxiliary files.')
+    if not os.path.isfile(args.filepath):
+        parser.error('Invalid filepath to extract output.')
     # The output directory is ours to create; asserting on it only
     # made a first run fail on a path the user never chose.
     os.makedirs(args.output_dir, exist_ok=True)
     # Fail before the run rather than mid-job inside a worker thread.
-    assert os.environ.get('GEOAPIFY_API_KEY'), \
-        'GEOAPIFY_API_KEY not set in the environment, exiting.'
+    if not os.environ.get('GEOAPIFY_API_KEY'):
+        parser.error('GEOAPIFY_API_KEY is not set in the environment.')
 
     print("Beginning geolocation validation.")
 
     newspaper = newspaper_from_path(args.filepath)
 
     sample = pd.read_parquet(args.filepath).iloc[:args.nrows]
-    assert sample.addresses.isna().sum() == 0, 'Have NAs in addresses, exiting.'
-    assert sample.addresses.dtype == 'object', 'Wrong addresses dtype, exiting.'
-    assert isinstance(sample.addresses.iloc[0], np.ndarray), 'Wrong addresses dtype, exiting.'
+    if not len(sample):
+        raise SystemExit('Input data is empty.')
+    if not sample.index.is_unique:
+        raise SystemExit('Input row index contains duplicates.')
+    try:
+        validate_resume(len(sample), args.batch_size, args.skip)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if 'addresses' not in sample.columns or sample.addresses.isna().sum():
+        raise SystemExit('Missing or null `addresses` values, exiting.')
+    if not sample.addresses.map(lambda value: isinstance(value, (list, np.ndarray))).all():
+        raise SystemExit('Every `addresses` value must be a list/array, exiting.')
     print("Will resolve sample of {} observations from {}.".format(len(sample), newspaper))
 
     # Load US geo-data
@@ -336,10 +427,18 @@ if __name__ == "__main__":
         os.path.join(args.aux_dir, "geo/uscities.csv"),
         os.path.join(args.aux_dir, "neighbors-states.csv"),
         os.path.join(args.aux_dir, "geo/uszips.csv")
-    ).load(newspaper)
+    ).load(newspaper, min_pop=args.min_pop)
 
-    os.environ['GEOAPIFY_URL'] = args.geoapify_url # Note: pro URL would be 'https://bk01.geoapify.net'
-    set_rate_limit(args.rate_limit)
+    try:
+        os.environ['GEOAPIFY_URL'] = validate_base_url(args.geoapify_url)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if not 0 <= args.min_ok_share <= 1:
+        raise SystemExit('--min_ok_share must lie between 0 and 1.')
+    try:
+        set_rate_limit(args.rate_limit)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     print("Will make requests to GeoApify URL: '{}'{}".format(os.environ['GEOAPIFY_URL'],
         " at {} req/s".format(args.rate_limit) if args.rate_limit else ""))
 
@@ -347,8 +446,6 @@ if __name__ == "__main__":
     print("Beginning resolutions using {} threading ({} workers) at {}.".format(
         'multi' if args.multithreading else 'mono', args.nworkers or 1, time_now()))
     st_time = time.time()
-    county_batches = []
-
     for batch_idx in range(ceil(len(sample) / args.batch_size)):
         if args.skip >= (batch_idx+1)*args.batch_size: continue
         batch = sample.addresses.iloc[batch_idx*args.batch_size:(batch_idx+1)*args.batch_size]
@@ -364,7 +461,7 @@ if __name__ == "__main__":
         # unguarded final save below would fail the same way after days of work.
         counties_batch.to_parquet(add_filepath_suffix(args.output_dir, newspaper,
             n=(batch_idx+1)*args.batch_size, suffix='resolve-batch'), compression='gzip')
-        county_batches.append(counties_batch)
+        assign_batch_results(sample, counties_batch)
         cached, hits = cache_stats()
         print("Processed ads {}-{} at {} ({} queries cached, {} calls saved; "
             "statuses {})...".format(
@@ -377,9 +474,6 @@ if __name__ == "__main__":
                 "(statuses {}). Nothing after this point would resolve; batches "
                 "written so far are intact.".format(ok_share(), status_summary()))
         
-    if county_batches:
-        sample = sample.join(pd.concat(county_batches))
-
     # Full runs are named '-resolve-all' to match extract.py's convention (and
     # the README's statistics loop); a resumed run (--skip) carries NaN for the
     # skipped rows and so must not overwrite a complete file.
@@ -387,8 +481,9 @@ if __name__ == "__main__":
     out_suffix = 'resolve' if not args.skip else 'resolve-from{}'.format(args.skip)
     sample.to_parquet(add_filepath_suffix(args.output_dir, newspaper, n=out_n,
         suffix=out_suffix), compression='gzip')
-    sample.to_csv(add_filepath_suffix(args.output_dir, newspaper, n=out_n,
-        suffix=out_suffix, ext='csv'))
+    if args.write_csv:
+        sample.to_csv(add_filepath_suffix(args.output_dir, newspaper, n=out_n,
+            suffix=out_suffix, ext='csv'))
     elapsed = time.time() - st_time
     cached, hits = cache_stats()
     print("Completed resolutions at {} in {} minutes ({} seconds). "
@@ -396,5 +491,3 @@ if __name__ == "__main__":
         "Request statuses: {}.\n".format(
         time_now(), round(elapsed/60, 2), round(elapsed), cached, hits,
         status_summary()))
-
-

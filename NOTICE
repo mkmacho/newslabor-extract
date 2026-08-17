@@ -1,0 +1,95 @@
+# Third-party data and notices
+
+This file describes material present in the current repository tree. It does not
+grant a project-wide license. See `LICENSE` for the repository's rights statement.
+
+## Asset summary
+
+| Path | Source and status |
+|---|---|
+| `auxiliary_files/geo/uscities.csv` | Derived by `scripts/build_geo_reference.py` from U.S. Census Bureau sources and the GeoNames US postal-code file described below. |
+| `auxiliary_files/geo/uszips.csv` | Derived by the same script from U.S. Census Bureau relationship files, Gazetteer files, and GeoNames fallback records. |
+| `auxiliary_files/states.csv` | Derived by the same script from the Census Bureau national state-code reference. |
+| `auxiliary_files/neighbors-states.csv` | From Ubikuity's `List-of-neighboring-states-for-each-US-state`; MIT notice reproduced below. |
+| `test_data/NJG-sample.csv` | Synthetic data generated reproducibly by `scripts/make_sample_corpus.py` with seed `20260817`; it is not derived from a historical advertisement. |
+
+The production advertisement corpus, production geocoder outputs, and paper
+analysis datasets are not included.
+
+## U.S. Census Bureau
+
+The geography builder uses:
+
+- Census Bureau [national state-code
+  reference](https://www2.census.gov/geo/docs/reference/state.txt);
+- American Community Survey 2019–2023 5-Year Table-Based Summary File, table
+  B01003, plus the 2018–2022 edition for three omitted places;
+- ACS 2023 geography lookup (`Geos20235YR`);
+- 2020 Census ZCTA-to-County, ZCTA-to-Place, and
+  ZCTA-to-County-Subdivision relationship files;
+- 2023 Gazetteer county and county-subdivision files.
+
+These are works of the U.S. Census Bureau, a U.S. federal agency. The public-domain
+status asserted here rests on 17 U.S.C. §§ 101 and 105. This repository is not
+endorsed or certified by the U.S. Census Bureau.
+
+## GeoNames — CC BY 4.0
+
+Source: [GeoNames US postal-code export](https://download.geonames.org/export/zip/US.zip)
+
+This product contains information from [GeoNames](https://www.geonames.org/).
+Its [export terms](https://www.geonames.org/export/) make the data available
+under the [Creative Commons Attribution 4.0 International
+license](https://creativecommons.org/licenses/by/4.0/).
+
+Modifications: county FIPS codes are re-derived from state and `admin2` fields;
+records are combined with U.S. Census Bureau sources; Census-derived values take
+precedence where sources overlap. GeoNames is used as a fallback for postal codes,
+including some PO-box-only and unique ZIP codes, that Census ZCTAs do not model.
+Redistributors of the derived geography files must preserve the applicable
+GeoNames attribution and license notice. The builder pins the SHA-256 digest of
+the audited download and fails closed on drift. Because the GeoNames URL is
+mutable and the source archive is not bundled, that check detects a changed
+download but does not guarantee future retrieval of the audited bytes.
+
+## Ubikuity state adjacency — MIT License
+
+Source: [Ubikuity, *List of neighboring states for each US
+state*](https://github.com/ubikuity/List-of-neighboring-states-for-each-US-state)
+
+The MIT License (MIT)
+
+Copyright (c) 2013 Ubikuity
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Dependencies and services
+
+Packages installed from `requirements.txt` retain their own licenses. They are
+dependencies, not relicensed by this repository. In particular, text cleaning
+loads `frequency_dictionary_en_82_765.txt` from the pinned `symspellpy` 6.7.7
+package rather than redistributing a dictionary in this repository. The
+[`symspellpy` code declares the MIT
+License](https://github.com/mammothb/symspellpy/blob/v6.7.7/LICENSE), while
+[SymSpell documents the dictionary](https://github.com/wolfgarbe/SymSpell#frequency-dictionary)
+as an intersection of Google Books Ngram data ([CC BY
+3.0](https://creativecommons.org/licenses/by/3.0/)) and SCOWL ([source
+terms](https://wordlist.aspell.net/scowl-readme/)). Those source terms remain
+applicable; this repository does not relicense the installed dictionary.
+Geoapify requests and responses are governed by the user's agreement with
+Geoapify; no response payload is bundled here.

@@ -1,0 +1,32 @@
+# Rights statement — no project-wide open-source license
+
+No project-wide open-source license is granted for this repository.
+
+The repository is made publicly viewable as a research-software, transparency,
+and portfolio artifact. Except where a file carries a separate license, rights
+remain with their respective copyright holders. Public availability on GitHub
+does not grant permission to copy, modify, distribute, sublicense, or use the
+material beyond permissions supplied by applicable law or a separate license.
+
+Miguel Camacho Horvitz does not purport to license:
+
+- contributions or research materials owned by collaborators, employers, or
+  institutions;
+- the non-public historical advertisement corpus or research outputs, which are
+  not included;
+- third-party auxiliary data, derived data, or software dependencies.
+
+Third-party paths and their known terms are listed in `NOTICE`. In particular,
+GeoNames-derived material carries CC BY 4.0 obligations, U.S. Census Bureau
+material retains its public-domain status under U.S. law, and the Ubikuity
+adjacency table is distributed under MIT.
+
+For permission to reuse repository-authored code, contact the repository owner
+and, where relevant, the research rights holders. A standard software license may
+be added only after ownership and collaborator authorization are confirmed.
+
+THE MATERIAL IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+A PARTICULAR PURPOSE, AND NONINFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY
+LAW, THE AUTHORS AND RIGHTS HOLDERS ARE NOT LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY ARISING FROM THE MATERIAL OR ITS USE.

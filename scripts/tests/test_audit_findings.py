@@ -1,11 +1,10 @@
-"""Tests for the findings in AUDIT.md (2026-08-16).
+"""Regression tests for the pipeline's documented correctness safeguards.
 
-Each test asserts the *intended* behavior, so on the pre-audit code the tests
-fail in the exact way the audit describes, and pass once the fixes are applied.
-Test names reference AUDIT.md finding IDs (A1, A2, ...).
+Each test asserts current intended behavior at a boundary where silent errors
+would materially change extracted research variables.
 
 Run from the repo root:
-    <venv>/bin/python -m pytest scripts/tests/test_audit_findings.py -v
+    python -m pytest scripts/tests/test_audit_findings.py -v
 
 No network access: the Geoapify test stubs out the HTTP layer.
 """
@@ -22,6 +21,7 @@ AUX_DIR = os.path.join(REPO_ROOT, "auxiliary_files")
 sys.path.insert(0, SCRIPTS_DIR)
 
 import common  # noqa: E402
+import build_geo_reference  # noqa: E402
 import resolve  # noqa: E402
 from extract import Newspaper  # noqa: E402
 
@@ -48,7 +48,14 @@ def us_data_with_zips():
 
 @pytest.fixture(scope="module")
 def text_help():
-    return common.TextWrapper(os.path.join(AUX_DIR, "dictionary_list.txt"))
+    return common.TextWrapper()
+
+
+def test_packaged_dictionary_is_loaded(text_help):
+    """The public build uses symspellpy's versioned, MIT-licensed resource."""
+    assert text_help.dictionary_source == (
+        "symspellpy:frequency_dictionary_en_82_765.txt")
+    assert len(text_help.dictionary) == 82_834
 
 
 @pytest.fixture(scope="module")
@@ -186,6 +193,55 @@ def test_a6_substring_time_inversion(text_help):
     for cand in (best, potential, weak):
         assert cand is None or "our" not in cand.split(), (
             f"substring time-match extended the wage with 'our': {cand!r}")
+
+
+def test_packaged_dictionary_does_not_turn_street_number_into_wage(text_help):
+    """A spell-corrected street name beside ``St`` is not wage evidence.
+
+    The packaged SymSpell dictionary corrects the OCR-like ``Berkly`` to
+    ``weekly``. The following street number therefore looked exactly like a
+    non-dollar weekly wage during the dictionary transition.
+    """
+    tokens = text_help.clean_for_wage(
+        "seamstress apply 3296 Berkly St Norfolk").split()
+    assert tokens[2:5] == ["3296", "weekly", "st"]
+    assert text_help.format_wage_candidate(tokens, 2) == (None, None, None)
+
+    # A dollar sign is independent wage evidence, even if an address follows.
+    marked = "$500 weekly St Louis".split()
+    best, potential, _ = text_help.format_wage_candidate(marked, 0)
+    assert best == "$500 weekly"
+    assert potential is None
+
+
+def test_geo_builder_rejects_state_specific_truncated_names():
+    """Builder canaries reject old LSAD bugs without rejecting real places."""
+    norfolk_zips = "23501 23506 23514 23515 23519 23529 23541"
+    rows = [
+        ("Washington", "DC", "11001", "District of Columbia", ""),
+        ("Norfolk", "VA", "51710", "Norfolk", norfolk_zips),
+        ("Jersey City", "NJ", "34017", "Hudson", "07302"),
+        ("Panama City", "FL", "12005", "Bay", "32401"),
+        ("Winston-Salem", "NC", "37067", "Forsyth", "27101"),
+        # These short names are legitimate Census places outside the states
+        # where repeated suffix stripping formerly created false rows.
+        ("Jersey", "GA", "13297", "Walton", "30014"),
+        ("Panama", "IA", "19165", "Shelby", "51562"),
+        ("Winston", "OR", "41019", "Douglas", "97496"),
+    ]
+    cities = pd.DataFrame(rows, columns=[
+        "city", "state_id", "county_fips", "county_name", "zips"])
+    zips = pd.DataFrame([("23501", "51710")],
+                        columns=["zip", "county_fips"])
+    assert build_geo_reference.sanity_check(cities, zips) == []
+
+    broken = pd.concat([
+        cities,
+        pd.DataFrame([("Jersey", "NJ", "34017", "Hudson", "07302")],
+                     columns=cities.columns),
+    ], ignore_index=True)
+    assert build_geo_reference.sanity_check(broken, zips) == [
+        "name normalisation introduced truncated 'Jersey' in NJ"]
 
 
 def test_b6_adjacent_zipcodes_both_found(us_data):

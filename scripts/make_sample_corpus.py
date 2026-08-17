@@ -11,8 +11,8 @@ Nothing here is copied from a real advertisement. Every ad is composed from
 templates and word lists written for this file, then deliberately degraded to
 imitate what OCR does to eighty-year-old newsprint.
 
-The corpus is built to exercise the paths that actually broke during the audit,
-so it doubles as a fixture:
+The corpus is built to exercise known OCR and parsing edge cases, so it doubles
+as a regression fixture:
 
   * every street marker, including the low-precision ones (Court, Ct, Pl, Ln,
     Circuit) both with and without a house number, since they are only accepted
@@ -21,7 +21,7 @@ so it doubles as a fixture:
     is how concatenated multi-ad records actually look
   * years either side of 1963, so the ZIP-code gate is exercised in both states
   * PO-box ZIP codes such as 23501 that have no census ZCTA
-  * wage phrasings that each failed differently: "$8 a day" (single digit),
+  * difficult wage phrasings: "$8 a day" (single digit),
     "$500 a week" (rate word after a stop word), "500 per week" (no dollar sign),
     OCR-split decimals like "$9 75 hour", and explicit ranges
   * real-estate and non-job advertisements, which the filter is meant to skip
@@ -121,8 +121,8 @@ def make_ad(rng, year):
         marker = (rng.choice(GATED_MARKERS) if rng.random() < 0.18
                   else rng.choice(MARKERS))
         street = rng.choice(STREETS)
-        # Gated markers appear both with and without a number on purpose: the
-        # numberless form is what the audit found matching courthouse boilerplate.
+        # Gated markers appear both with and without a number on purpose; the
+        # numberless form checks rejection of courthouse boilerplate.
         if rng.random() < 0.75:
             parts.append("apply {} {} {}".format(
                 rng.randint(2, 3999), street, marker))

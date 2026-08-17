@@ -3,6 +3,27 @@ import pandas as pd
 import os
 from common import add_filepath_suffix, newspaper_from_path
 
+
+def validate_batch_indices(sample, full_extractions):
+    '''Require a one-to-one match before joining or deleting checkpoints.'''
+    if not sample.index.is_unique:
+        raise ValueError("Template index contains duplicate row ids.")
+    if not full_extractions.index.is_unique:
+        raise ValueError(
+            "Extraction batches contain duplicate row ids (overlapping batches).")
+    if len(full_extractions) != len(sample):
+        raise ValueError(
+            "Found {} extraction rows for {} template rows: batches are missing "
+            "or --batch_size/--skip do not match the producing run.".format(
+                len(full_extractions), len(sample)))
+
+    missing = sample.index.difference(full_extractions.index)
+    extra = full_extractions.index.difference(sample.index)
+    if len(missing) or len(extra):
+        raise ValueError(
+            "Batch row ids do not match the template (missing {}, extra {})."
+            .format(missing[:5].to_list(), extra[:5].to_list()))
+
 def main():
     ''' Concatenate and join batched extractions. '''
 
@@ -31,7 +52,7 @@ def main():
     newspaper = newspaper_from_path(args.filepath)
 
     # Concatenate extraction batches
-    batch_frames = []
+    batch_frames, batch_files = [], []
     nbatches = args.nbatches or (len(sample) // args.batch_size + 1)
     print("Iterating over {} batches.".format(nbatches))
     for batch_idx in range(nbatches):
@@ -41,28 +62,30 @@ def main():
             print("File not found: '{}'".format(file))
             break
         batch_frames.append(pd.read_parquet(file))
+        batch_files.append(file)
         print("After batch {}, have {} extraction rows.".format(
             file, sum(len(f) for f in batch_frames)))
 
     full_extractions = pd.concat(batch_frames) if batch_frames else pd.DataFrame()
-    assert len(full_extractions) == len(sample), (
-        "Found {} extraction rows for {} template rows: batches are missing or "
-        "--batch_size/--skip do not match the producing run.".format(
-            len(full_extractions), len(sample)))
+    validate_batch_indices(sample, full_extractions)
     sample = sample.join(full_extractions)
+    if not sample.index.is_unique or len(sample) != len(full_extractions):
+        raise RuntimeError(
+            "Join did not preserve the validated one-row-per-id template.")
 
     # Write full data to file
     # sample.to_csv(add_filepath_suffix(args.output_dir, newspaper, n=len(sample), suffix='extract-wage', ext='csv'))        
     print("Have final shape of {}.".format(sample.shape))
-    sample.to_parquet(add_filepath_suffix(args.output_dir, newspaper, n=len(sample), 
-        suffix='{}-merged'.format(args.suffix)), compression='gzip')
+    output_file = add_filepath_suffix(args.output_dir, newspaper, n=len(sample),
+        suffix='{}-merged'.format(args.suffix))
+    sample.to_parquet(output_file, compression='gzip')
+    if not os.path.isfile(output_file):
+        raise RuntimeError("Merged output was not written; keeping batches.")
 
     if args.delete:
-        for batch_idx in range(nbatches):
-            batch = args.batch_size * (batch_idx + 1) + args.skip
-            file = os.path.join(args.batch_dir, '-'.join([newspaper, args.suffix, 'batch', str(batch)]) + '.gzip')
-            if not os.path.isfile(file): 
-                break
+        # Delete exactly the checkpoints that were read and validated, and only
+        # after the merged parquet has been written successfully.
+        for file in batch_files:
             os.remove(file)
             print("Removed batch {}.".format(file))
 
@@ -86,10 +109,11 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    assert os.path.isfile(args.filepath), 'Invalid filepath to template data.'
-    assert os.path.isdir(args.batch_dir), 'Invalid filepath to batch directory.'
+    if not os.path.isfile(args.filepath):
+        parser.error('Invalid filepath to template data.')
+    if not os.path.isdir(args.batch_dir):
+        parser.error('Invalid filepath to batch directory.')
     # The output directory is ours to create; asserting on it only
     # made a first run fail on a path the user never chose.
     os.makedirs(args.output_dir, exist_ok=True)
     main()
-

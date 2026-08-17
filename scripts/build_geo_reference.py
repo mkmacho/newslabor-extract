@@ -1,13 +1,13 @@
 """Build the US city and ZIP reference tables from public sources.
 
-The pipeline previously shipped SimpleMaps' commercial city and ZIP databases,
-whose licence forbids public redistribution. This script rebuilds equivalent
-tables from sources that may be redistributed, and — more usefully for a reader —
-turns "trust these two CSVs" into "here is exactly where every column came from".
+The committed city and ZIP tables are reproducibly derived from the public and
+redistributable sources below. Pinned checksums and explicit transformations
+make the provenance of every output column inspectable.
 
 SOURCES
 
   U.S. Census Bureau (public domain, 17 U.S.C. 105):
+    National state-code reference                         state names / USPS codes
     ACS 2019-2023 5-year summary file, table B01003   place population
       (plus the 2022 vintage for three NY places the 2023 file drops)
     ACS geography lookup Geos20235YR                  place / place-in-county spine
@@ -24,21 +24,24 @@ pipeline's `find_nearby_zipcodes` emits real USPS ZIPs from pyzipcode. Dropping
 GeoNames costs 42 of 139 resolved counties on the CI slice. Because it is applied
 only where the Census has nothing, Census values always win where both exist.
 
-OUTPUT  auxiliary_files/geo/{uscities.csv,uszips.csv}  (~2.4 MB, vs 11.5 MB)
+OUTPUT  auxiliary_files/states.csv and
+        auxiliary_files/geo/{uscities.csv,uszips.csv}  (~2.4 MB, vs 11.5 MB)
 
 USAGE
     python scripts/build_geo_reference.py --download      # fetch, then build
     python scripts/build_geo_reference.py                 # rebuild from cache
 
 Downloads total ~163 MB into a cache directory and are not committed; only the
-two derived CSVs are.
+three derived CSVs are.
 """
 import argparse
 import collections
 import csv
+import hashlib
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -50,6 +53,7 @@ REL = CENSUS + "/geo/docs/maps-data/data/rel2020/zcta520"
 GAZ = CENSUS + "/geo/docs/maps-data/data/gazetteer/2023_Gazetteer"
 
 SOURCES = {
+    "state.txt": CENSUS + "/geo/docs/reference/state.txt",
     "acsdt5y2023-b01003.dat": ACS + "/2023/table-based-SF/data/5YRData/acsdt5y2023-b01003.dat",
     "acsdt5y2022-b01003.dat": ACS + "/2022/table-based-SF/data/5YRData/acsdt5y2022-b01003.dat",
     "Geos20235YR.txt": ACS + "/2023/table-based-SF/documentation/Geos20235YR.txt",
@@ -60,6 +64,58 @@ SOURCES = {
     "2023_Gaz_cousubs_national.zip": GAZ + "/2023_Gaz_cousubs_national.zip",
     "geonames_US.zip": "https://download.geonames.org/export/zip/US.zip",
 }
+
+# Hashes of the inputs used to build the committed tables on 2026-08-17. Most
+# Census URLs are already vintage-pinned; GeoNames' US.zip is a moving target, so
+# its checksum prevents a later rebuild from silently changing the public fixture.
+SOURCE_SHA256 = {
+    "state.txt": "bea4e03f71a1fa0045ae732aabad11fa541e5932b071c2369bb0d325e8cba5a0",
+    "acsdt5y2023-b01003.dat": "24ae3f523b4c54332ce0a71ba534569685a8a729056f975915d860d1eb943565",
+    "acsdt5y2022-b01003.dat": "45f7e8d4fd2e3752d5219924ef01e886bfe70bcbe38524cd81d38abc7d1fa392",
+    "Geos20235YR.txt": "f019d5c157e2f4083b2d5e8af116825d7b129cfe57e6fa65b6e6ce615cb564b1",
+    "tab20_zcta520_county20_natl.txt": "3ed41278d637dc249e0323306f68be8a6c234e3090f4de88ef328dee71aeaaaf",
+    "tab20_zcta520_place20_natl.txt": "698a5dad71ed419411677d0ffd8ecd9331067f59c472cdd239b92c12f698285d",
+    "tab20_zcta520_cousub20_natl.txt": "406d2f1b11692a185e930e53f63a68951e5b64dbb7b0cf201a934a8e54aee27b",
+    "2023_Gaz_counties_national.zip": "919df59ba90759cce85468c0337e898e4b39c08eaffce86ddd88fa41f1f7f0c8",
+    "2023_Gaz_cousubs_national.zip": "22f4892eadaa4236add3b3dd015dff401e74e1aef32a7717a15e44c23dbdc1f3",
+    "geonames_US.zip": "9cef7c13628216aff6d027bc50f6b167e389c779696902f0cb1de1ab37c49924",
+}
+
+
+def build_states(cache):
+    """Build the 50-state + DC lookup from Census' national code reference.
+
+    The source also contains Puerto Rico and the island areas. The historical
+    pipeline's geography profiles cover the 50 states and DC, so retaining FIPS
+    codes 01--56 preserves that scope while replacing an unlicensed GitHub copy
+    of the same factual mapping.
+    """
+    states = pd.read_csv(os.path.join(cache, "state.txt"), sep="|", dtype=str)
+    states = states[pd.to_numeric(states.STATE, errors="coerce") <= 56]
+    states = states.rename(columns={"STATE_NAME": "State",
+                                    "STUSAB": "Abbreviation"})
+    states = states[["State", "Abbreviation"]].sort_values("State")
+    if len(states) != 51 or "DC" not in set(states.Abbreviation):
+        raise ValueError("Census state reference did not yield 50 states plus DC")
+    return states.reset_index(drop=True)
+
+
+def verify_sources(cache):
+    """Fail closed when an upstream file differs from the audited inputs."""
+    mismatches = []
+    for name, expected in SOURCE_SHA256.items():
+        path = os.path.join(cache, name)
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != expected:
+            mismatches.append("{}: expected {}, got {}".format(
+                name, expected, actual))
+    if mismatches:
+        raise ValueError("Source checksum mismatch; review upstream changes before "
+                         "updating SOURCE_SHA256:\n  " + "\n  ".join(mismatches))
 
 # Place-name suffixes. Stripped ONCE, never in a loop: repeated stripping turns
 # "Jersey City city" into "Jersey" and "Panama City city" into "Panama".
@@ -73,9 +129,9 @@ COUNTY_SUFFIX = re.compile(r"\s+(County|Parish|Borough|Census Area|Municipality|
 PLACE_SUFFIX = re.compile(r"\s+(city|town|village|borough|CDP|municipality|township|"
                           r"comunidad|zona urbana|urbana|plantation)$")
 
-# New York city's largest place-part is Kings (Brooklyn); the pipeline wants the
-# county the city is named for. SimpleMaps recorded Queens here, which AUDIT.md
-# P8 identifies as an error, so this is a correction rather than a divergence.
+# New York city spans five counties. For the consolidated city label, use the
+# namesake New York County (Manhattan); borough-specific rows retain their own
+# county FIPS codes below.
 COUNTY_OVERRIDE = {"3651000": "36061"}
 BOROUGHS = {"Manhattan": "36061", "Brooklyn": "36047", "Queens": "36081",
             "Bronx": "36005", "Staten Island": "36085"}
@@ -87,8 +143,14 @@ def fetch(cache, force=False):
         dest = os.path.join(cache, name)
         if os.path.exists(dest) and not force:
             continue
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("Refusing non-HTTPS source URL for {}.".format(name))
         print("  downloading {} ...".format(name), flush=True)
-        urllib.request.urlretrieve(url, dest)
+        # SOURCES is a fixed manifest, the scheme is checked above, and every
+        # downloaded byte stream is verified against a pinned SHA-256 digest.
+        urllib.request.urlretrieve(url, dest)  # nosec B310
+    verify_sources(cache)
     for name in ("2023_Gaz_counties_national.zip", "2023_Gaz_cousubs_national.zip",
                  "geonames_US.zip"):
         with zipfile.ZipFile(os.path.join(cache, name)) as z:
@@ -206,7 +268,8 @@ def build_city_zips(cache, fips_to_state):
 
     # USPS place names close the gap for cities that mail under another name.
     gn = read_geonames(cache)
-    for zipcode, place, state in zip(gn.zip.str.zfill(5), gn.place, gn.admin1code):
+    for zipcode, place, state in zip(
+            gn.zip.str.zfill(5), gn.place, gn.admin1code, strict=True):
         zips[(place, state)].add(zipcode)
     return zips
 
@@ -253,10 +316,11 @@ def build_uszips(cache, fips_to_name, state_to_fips):
 
     gn = read_geonames(cache)
     gn["fips"] = [(state_to_fips.get(a, "") + b.zfill(3)) if a in state_to_fips and b
-                  else "" for a, b in zip(gn.admin1code, gn.admin2code)]
+                  else "" for a, b in zip(
+                      gn.admin1code, gn.admin2code, strict=True)]
     gn = gn[(gn.fips.str.len() == 5) & (gn.fips.isin(fips_to_name))].drop_duplicates("zip")
     added = 0
-    for zipcode, fips in zip(gn.zip.str.zfill(5), gn.fips):
+    for zipcode, fips in zip(gn.zip.str.zfill(5), gn.fips, strict=True):
         if zipcode not in zip_to_fips:        # fallback only; Census always wins
             zip_to_fips[zipcode] = fips
             added += 1
@@ -270,10 +334,9 @@ def build_uszips(cache, fips_to_name, state_to_fips):
     return out
 
 
-def build_uscities(cache, aux_dir, population, fips_to_name, city_zips):
+def build_uscities(cache, states, population, fips_to_name, city_zips):
     places, parts, ny_cousubs = load_geography(cache)
-    states = pd.read_csv(os.path.join(aux_dir, "states.csv"))
-    id_to_state = dict(zip(states.Abbreviation, states.State))
+    id_to_state = dict(zip(states.Abbreviation, states.State, strict=True))
 
     # county_fips per place: the county part holding the most people wins.
     best_part = {}
@@ -358,17 +421,25 @@ def sanity_check(cities, zips):
         if not want <= have:
             problems.append("Norfolk VA missing PO-box ZIPs %s" % sorted(want - have))
 
-    z = dict(zip(zips.zip, zips.county_fips))
+    z = dict(zip(zips.zip, zips.county_fips, strict=True))
     if z.get("23501") != "51710":
         problems.append("ZIP 23501 -> %r, expected 51710" % z.get("23501"))
     if not cities.county_fips.dropna().map(len).eq(5).all():
         problems.append("some county_fips are not 5 characters")
     if cities.county_name.str.endswith(" County").any():
         problems.append("county_name still carries its type suffix")
-    for bad, good in (("Jersey", "Jersey City"), ("Panama", "Panama City"),
-                      ("Winston", "Winston-Salem")):
-        if good not in set(cities.city):
+    # The short names are legitimate places in other states (for example,
+    # Panama, IA), so check the relevant state rather than rejecting them
+    # globally.
+    city_keys = set(zip(cities.city, cities.state_id, strict=True))
+    for bad, good, state in (("Jersey", "Jersey City", "NJ"),
+                             ("Panama", "Panama City", "FL"),
+                             ("Winston", "Winston-Salem", "NC")):
+        if (good, state) not in city_keys:
             problems.append("name normalisation lost %r" % good)
+        if (bad, state) in city_keys:
+            problems.append("name normalisation introduced truncated %r in %s" %
+                            (bad, state))
     return problems
 
 
@@ -392,13 +463,15 @@ if __name__ == "__main__":
     missing = [n for n in SOURCES if not os.path.exists(os.path.join(args.cache, n))]
     if missing:
         sys.exit("Missing sources {}. Run with --download.".format(missing))
+    verify_sources(args.cache)
 
     print("Building reference tables...")
+    states = build_states(args.cache)
     population = load_population(args.cache)
     fips_to_name, fips_to_state, state_to_fips = county_lookups(args.cache)
     city_zips = build_city_zips(args.cache, fips_to_state)
     zips = build_uszips(args.cache, fips_to_name, state_to_fips)
-    cities = build_uscities(args.cache, args.aux_dir, population, fips_to_name, city_zips)
+    cities = build_uscities(args.cache, states, population, fips_to_name, city_zips)
 
     problems = sanity_check(cities, zips)
     if problems:
@@ -406,13 +479,17 @@ if __name__ == "__main__":
     print("  sanity checks passed")
 
     os.makedirs(args.out, exist_ok=True)
+    os.makedirs(args.aux_dir, exist_ok=True)
+    states_path = os.path.join(args.aux_dir, "states.csv")
     cpath = os.path.join(args.out, "uscities.csv")
     zpath = os.path.join(args.out, "uszips.csv")
+    states.to_csv(states_path, index=False, quoting=csv.QUOTE_ALL)
     cities.to_csv(cpath, index=False)
     zips.to_csv(zpath, index=False)
     total = os.path.getsize(cpath) + os.path.getsize(zpath)
-    print("\nWrote {} ({:,} rows) and {} ({:,} rows) — {:.1f} MB total.".format(
-        cpath, len(cities), zpath, len(zips), total / 1e6))
+    print("\nWrote {} ({} rows), {} ({:,} rows) and {} ({:,} rows)"
+          " — {:.1f} MB total.".format(
+        states_path, len(states), cpath, len(cities), zpath, len(zips), total / 1e6))
     print("Places >= 50,000: {}. NOTE these are ACS *place* populations, not the"
           " urban-agglomeration figures the previous data used.".format(
               int((cities.population >= 50000).sum())))

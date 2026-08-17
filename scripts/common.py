@@ -1,7 +1,7 @@
 import os
 import re
+from importlib import resources
 import pandas as pd
-from statistics import mode
 from pyzipcode import ZipCodeDatabase
 from symspellpy import SymSpell
 # from jamspell import TSpellCorrector
@@ -74,13 +74,32 @@ def _wage_candidate_array(tokens, start, end, prefix=True):
 
 
 class TextWrapper(object):
-    def __init__(self, dictionary_filepath):
+    """Text cleaning backed by SymSpell's packaged English dictionary.
+
+    ``symspellpy`` ships the frequency dictionary used by its own examples. Using
+    that installed resource keeps the lexicon tied to the pinned package without
+    redistributing a separate frequency dictionary. An explicit path remains
+    available for controlled private runs.
+    """
+
+    DEFAULT_DICTIONARY = "frequency_dictionary_en_82_765.txt"
+
+    def __init__(self, dictionary_filepath=None):
         self.checker = SymSpell()
-        loaded = self.checker.load_dictionary(dictionary_filepath, 0, 1)
+        if dictionary_filepath is None:
+            dictionary_resource = resources.files("symspellpy").joinpath(
+                self.DEFAULT_DICTIONARY)
+            with resources.as_file(dictionary_resource) as dictionary_path:
+                loaded = self.checker.load_dictionary(dictionary_path, 0, 1)
+            dictionary_label = "symspellpy:{}".format(self.DEFAULT_DICTIONARY)
+        else:
+            loaded = self.checker.load_dictionary(dictionary_filepath, 0, 1)
+            dictionary_label = str(dictionary_filepath)
         assert loaded, "SymSpell dictionary not loaded from '{}'.".format(
-            dictionary_filepath)
+            dictionary_label)
         self.dictionary = self.checker.words
         assert self.dictionary, "SymSpell dictionary loaded but empty."
+        self.dictionary_source = dictionary_label
         self.CARDINAL_DIRECTIONS = ["east","e","west","w","north","n","south","s"]
         self.REAL_ESTATE = ["decorated","refurbish","remodel","bedroom","bathroom", 
                          "tenant","furniture","deluxe","furnish","apartment",
@@ -98,7 +117,7 @@ class TextWrapper(object):
         self.STREET_MARKERS_NEED_NUMBER = {"ct", "pl", "ln", "court", "place", "circuit"}
         # Short tokens that must survive clean_tokenize's length filter regardless
         # of whether they appear in the English dictionary. Without this, markers
-        # like "rd"/"ct" (absent from dictionary_list.txt) were deleted before
+        # like "rd"/"ct" (absent from the frequency dictionary) were deleted before
         # STREET_MARKERS was ever consulted. State abbreviations are added by
         # set_state_abbreviations() once the US state table is available.
         self.SHORT_KEEP = set(self.STREET_MARKERS_ABBREV) | set(self.CARDINAL_DIRECTIONS)
@@ -150,11 +169,11 @@ class TextWrapper(object):
     def potential_salary(self, word:str):
         # Decimal part is a single optional group: a bare '\d{1,2}?' still
         # requires one digit, which rejected all single-digit wages ("$8 a day").
-        if not re.findall('^\$?\d+(?:[.,]\d{1,2})?\$?[-\s]', word + " "):
+        if not re.findall(r'^\$?\d+(?:[.,]\d{1,2})?\$?[-\s]', word + " "):
             return False
         if first_digit(word) == '0': 
             return False
-        if re.findall('\d{0,3}-?\s?\d{3}-?\s?\d{4}', word): 
+        if re.findall(r'\d{0,3}-?\s?\d{3}-?\s?\d{4}', word):
             return False
         return True
 
@@ -193,6 +212,14 @@ class TextWrapper(object):
             # Case when e.g. "$500 WEEKLY" or e.g. "$500 PER WEEK"
             if (i == idx+2 and candidate_arr[-1] in self.RATES_SINGLE) or \
                 (i == idx+3 and ' '.join(candidate_arr[-2:]) in self.RATES_DOUBLE):
+                # SymSpell can turn an OCR-damaged street name immediately
+                # before "St" into a rate word (for example, "3296 Berkly St"
+                # became "3296 weekly st"). A bare number followed by that
+                # synthetic rate is an address, not pay. Dollar-marked amounts
+                # remain eligible because they carry independent wage evidence.
+                next_token = tokens[idx+2].lower() if idx+2 < len(tokens) else None
+                if '$' not in tokens[idx] and next_token in self.STREET_MARKERS:
+                    break
                 if '$' in tokens[idx]: 
                     best_candidate = candidate
                 else: 
@@ -285,20 +312,20 @@ class TextWrapper(object):
         # Addl spaces
         spaces = ' ' + re.sub(' {2,}', ' ', text).strip() + ' '
         # Consecutive digits
-        d = re.sub('(?<=\s\d)\s+(?=\d+\s)', '', spaces)
-        d = re.sub('(?<=\s\d\d)\s+(?=\d+\s)', '', d)
-        d = re.sub('(?<=\s\d\d\d)\s+(?=\d+\s)', '', d)
-        d = re.sub('(\s\$?\s?\d+)\s?(\d+\$?\s)', r'\1\2', d)
+        d = re.sub(r'(?<=\s\d)\s+(?=\d+\s)', '', spaces)
+        d = re.sub(r'(?<=\s\d\d)\s+(?=\d+\s)', '', d)
+        d = re.sub(r'(?<=\s\d\d\d)\s+(?=\d+\s)', '', d)
+        d = re.sub(r'(\s\$?\s?\d+)\s?(\d+\$?\s)', r'\1\2', d)
         # Decimals
-        x = re.sub('(\s\$?\s?\d+)\s?(\.|,)\s?(\d{1,3}\$?\s)', r'\1\2\3', d)
+        x = re.sub(r'(\s\$?\s?\d+)\s?(\.|,)\s?(\d{1,3}\$?\s)', r'\1\2\3', d)
         # Dollar digits
-        x = re.sub('\s[s|t|f|F|S|\$]\s?(\d+[,|\.]?\d*)\$?\s',r' $\1 ', x)
-        x = re.sub('\s(\d+[,|\.]?\d*)[s|t|f|F|S|\$]\s',r' \1$ ', x)
+        x = re.sub(r'\s[s|t|f|F|S|\$]\s?(\d+[,|\.]?\d*)\$?\s',r' $\1 ', x)
+        x = re.sub(r'\s(\d+[,|\.]?\d*)[s|t|f|F|S|\$]\s',r' \1$ ', x)
         # Colons
-        x = re.sub('\s-\s|\s-\$?\d+|\d+-\s', '-', x)
+        x = re.sub(r'\s-\s|\s-\$?\d+|\d+-\s', '-', x)
         # Extra punctuation
         punct = x.translate(str.maketrans('', '', '!"#%&\'()*+/:;<>?@[\\]^_`{|}~'))
-        punct = re.sub('\s\.\s|\s,\s|\s-|-\s',' ',punct)
+        punct = re.sub(r'\s\.\s|\s,\s|\s-|-\s',' ',punct)
         return self._correct_sentence(punct.lower(), ignore_non_words=True)
 
     def find_street(self, tokens_list:str, idx:int):
@@ -367,7 +394,7 @@ class USGeoData(object):
         # Database of US states and state abbreviations
         self.US_STATES = pd.read_csv(states_fp).rename(
             {"State":"state_name","Abbreviation":"state_id"}, axis='columns')
-        # Database of US cities and city-level information from SimpleMaps
+        # Derived city/county reference built from Census and GeoNames sources.
         self.US_CITIES = pd.read_csv(cities_fp, dtype={'county_fips':str})[
             ['city','state_id','state_name','county_name','county_fips','zips','population']
         ]
@@ -393,20 +420,18 @@ class USGeoData(object):
                 states.append(r.state_name)
 
         self.ZIPCODE_DB = ZipCodeDatabase()
-        # Authoritative zipcode -> county lookup (simplemaps uszips.csv). Falls
-        # back to scanning the city table's `zips` column when not supplied.
-        # Zipcode -> county lookups, built from BOTH shipped sources. uszips.csv
-        # is authoritative but covers only ZCTAs, so it omits PO-box-only codes
-        # that appear in ads (Norfolk's 23501 among them); the city table's `zips`
-        # column carries those. City rows are applied first and uszips overlaid on
-        # top, so the authoritative value wins wherever both have the code.
+        # ZIP-to-county lookups are built from both derived reference tables.
+        # `uszips.csv` is the primary mapping; its Census component covers ZCTAs,
+        # while GeoNames fallback rows and the city table retain some PO-box-only
+        # and unique codes (Norfolk's 23501 among them). City rows are applied
+        # first and `uszips.csv` is overlaid wherever both carry the code.
         # County FIPS is the joinable key analysis actually needs: county *names*
         # are not unique nationally (1,910 names span 3,207 name+state pairs).
         self.ZIP_TO_COUNTY, self.ZIP_TO_FIPS = {}, {}
         # Where two city rows claim the same zipcode, the MORE SPECIFIC row wins:
         # rows are written in order of decreasing zip-list length, so the shortest
         # (most specific) list is applied last. Ranking by population instead let
-        # simplemaps' consolidated "New York" row — population 18.9M, 308 zips,
+        # a consolidated "New York" row — population 18.9M, 308 zips,
         # county recorded as Queens — overwrite 96 Manhattan zipcodes that the
         # borough's own row labels correctly. Benchmarked against uszips, this
         # ordering agrees on 95.9% of shared zips versus 95.2% for population.
@@ -423,19 +448,17 @@ class USGeoData(object):
             uszips = pd.read_csv(zips_fp, usecols=['zip','county_name','county_fips'],
                 dtype={'zip':str, 'county_name':str, 'county_fips':str})
             zips5 = uszips.zip.str.zfill(5)
-            self.ZIP_TO_COUNTY.update(dict(zip(zips5, uszips.county_name)))
+            self.ZIP_TO_COUNTY.update(dict(
+                zip(zips5, uszips.county_name, strict=True)))
             have_fips = uszips.county_fips.notna()
             self.ZIP_TO_FIPS.update(dict(zip(zips5[have_fips],
-                uszips.county_fips[have_fips].str.zfill(5))))
+                uszips.county_fips[have_fips].str.zfill(5), strict=True)))
         print("Loaded USA geo-data.")
 
-    # Population threshold for a place to be a candidate city. Expressed in ACS
-    # *place* population. The previous SimpleMaps table shipped urban-agglomeration
-    # figures 4-8x larger (Richmond VA 1,073,223 against an actual city of 227,595),
-    # so its 50,000 gate corresponds to roughly 15,000 here. Measured on NJG, 15,000
-    # reproduces and slightly exceeds the old candidate coverage; keeping 50,000
-    # against place populations would silently tighten the largest sampling
-    # restriction in the design. See AUDIT.md.
+    # Population threshold for a place to be a candidate city, expressed in ACS
+    # *place* population rather than metropolitan-area population. A higher gate
+    # can sharply tighten the largest sampling restriction in the design, so the
+    # 15,000 default remains explicit and configurable. See AUDIT.md.
     DEFAULT_MIN_POP = 15000
 
     def load(self, newspaper:str, min_pop=DEFAULT_MIN_POP):
@@ -461,10 +484,8 @@ class USGeoData(object):
     def counties_from_zips(self, zipcodes:list):
         ''' Map each zipcode to its county.
 
-        Returns one county per resolvable zipcode, so that the caller's mode()
-        picks the modal county *across* the observed zipcodes. (Previously this
-        took mode(zipcodes) first — discarding every other zipcode — and then
-        returned the counties of all cities whose zip list contained it.)
+        Returns one county per resolvable zipcode so the caller can select the
+        modal county across every mapped postcode.
         '''
         if not zipcodes: return None
         normalized = [str(z).strip()[:5] for z in zipcodes if z]
@@ -543,11 +564,8 @@ class USGeoData(object):
     def city_objects(self, city:str):
         ''' Rows for a city name, as plain dicts in source-file order.
 
-        Previously `US_CITIES[US_CITIES.city == city]`, a full 31k-row string
-        comparison run several times per advertisement. Profiling the extractor
-        showed those scans (pandas scalar_compare) accounted for 47% of total
-        runtime — more than all the fuzzy matching combined — so the lookup is
-        now an index built once at load.
+        CITY_INDEX is built once at load so candidate lookup avoids repeated
+        full-table string comparisons.
         '''
         return self.CITY_INDEX.get(city, ())
 
@@ -590,9 +608,8 @@ class USGeoData(object):
             if token.title() in self.biggest_nearby_cities:
                 matches[token] = {'name':token.title(), 'conf':100}
                 continue
-            # otherwise best probable match (process.extract is sorted best-first;
-            # iterating without breaking used to leave the *lowest* scorer above
-            # the threshold in `matches`)
+            # Otherwise take the best probable match; process.extract is sorted
+            # by descending confidence.
             if not self.sorted_nearby_cities: continue
             (city, score) = self._best_city_match(token.title())
             if score >= threshold:
@@ -643,4 +660,3 @@ class USGeoData(object):
                 if not abbrev_name in matches: 
                     matches[abbrev_name] = {'name':abbrev_name,'conf':score,'type':'id'}
         return matches
-

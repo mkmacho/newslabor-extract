@@ -8,8 +8,8 @@ monkeypatches its own request path, but a future test that forgets would spend
 real API credit. The autouse fixture below removes that possibility.
 
 It also resets resolve.py's module-level state between tests: the query cache,
-the cache-hit counter, the status histogram and the rate limiter are all globals,
-so without this a test's cached responses and counters leak into the next one.
+the in-flight requests, cache-hit counter, status histogram and rate limiter are
+all globals, so without this a test's state leaks into the next one.
 """
 import os
 import sys
@@ -43,6 +43,7 @@ def _offline_and_clean_globals():
     saved_session = resolve.SESSION
     resolve.SESSION = _NoNetwork()
     resolve._QUERY_CACHE.clear()
+    resolve._INFLIGHT.clear()
     resolve._CACHE_HITS[0] = 0
     resolve._STATUS_COUNTS.clear()
     resolve._RATE_STATE.update({"min_interval": 0.0, "next_time": 0.0})
@@ -51,5 +52,6 @@ def _offline_and_clean_globals():
     finally:
         resolve.SESSION = saved_session
         resolve._QUERY_CACHE.clear()
+        resolve._INFLIGHT.clear()
         resolve._CACHE_HITS[0] = 0
         resolve._STATUS_COUNTS.clear()

@@ -27,9 +27,14 @@ under an artificial 50/50 mixture: measured against a held-out label on the
 bundled sample, that error runs to 11 points, and its sign flips with the
 decade's coverage.
 
-Because the rows are weighted, the usual binomial interval is too narrow. The
-intervals below use Kish's effective sample size, n_eff = (sum w)^2 / sum(w^2),
-which discounts n for the variance the unequal weights introduce.
+Because the rows are weighted, the usual unweighted binomial interval is not
+appropriate. The intervals below use a Kish effective-sample-size Wilson
+interval, n_eff = (sum w)^2 / sum(w^2). This is a working approximation, not an
+exact stratified finite-population interval: it does not exploit the finite-
+population correction, and it assumes any uncoded rows are ignorable. The
+reproducible Monte Carlo in `verify_validation_design.py` checks its repeated-
+sampling behavior under several fixed finite populations, but human-coding
+nonresponse and error still require separate sensitivity analysis.
 
 Usage:
     python scripts/validate.py sample --filepath=<EXTRACT_OUTPUT.gzip> \
@@ -43,6 +48,7 @@ import argparse
 import math
 import os
 
+import numpy as np
 import pandas as pd
 
 from common import newspaper_from_path
@@ -77,7 +83,107 @@ def decade(year):
     return y // 10 * 10 if y > 0 else None
 
 
+def address_values(value):
+    '''Normalize the parquet address cell or reject a malformed value.'''
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return value
+    missing = pd.isna(value)
+    if isinstance(missing, (bool, np.bool_)) and missing:
+        return []
+    raise ValueError(
+        "Each `addresses` value must be a list/array of candidates or missing; "
+        "found {!r}.".format(type(value).__name__))
+
+
+def emitted_address(value):
+    return len(address_values(value)) > 0
+
+
 # ---------------------------------------------------------------- sampling ---
+
+def _cell_sort_key(cell):
+    d, found = cell
+    return (d is None, d if d is not None else 0, not found)
+
+
+def _sqrt_allocation(side, target):
+    '''Allocate an exact side total across cells, with one row per cell.'''
+    if not side:
+        if target:
+            raise ValueError("Cannot allocate rows to an empty sampling side.")
+        return {}
+    if target < len(side) or target > sum(len(group) for group in side.values()):
+        raise ValueError("Side target is incompatible with its stratum capacities.")
+
+    keys = sorted(side, key=_cell_sort_key)
+    roots = {key: math.sqrt(len(side[key])) for key in keys}
+
+    # Find the continuous, capacity-constrained square-root allocation
+    # x_h = clip(lambda*sqrt(N_h), 1, N_h). Binary search is O(H), independent
+    # of requested n.
+    low, high = 0.0, target / min(roots.values())
+    for _ in range(80):
+        scale = (low + high) / 2
+        total = sum(min(len(side[key]), max(1.0, scale * roots[key]))
+                    for key in keys)
+        if total < target:
+            low = scale
+        else:
+            high = scale
+    continuous = {
+        key: min(len(side[key]), max(1.0, high * roots[key])) for key in keys}
+    alloc = {key: int(math.floor(continuous[key])) for key in keys}
+
+    # Largest remainders make the integer allocation exact and deterministic.
+    remaining = target - sum(alloc.values())
+    eligible = [key for key in keys if alloc[key] < len(side[key])]
+    ranked = sorted(eligible,
+        key=lambda key: (-(continuous[key] - alloc[key]), _cell_sort_key(key)))
+    if remaining < 0 or remaining > len(ranked):
+        raise RuntimeError("Could not round the constrained sampling allocation.")
+    for key in ranked[:remaining]:
+        alloc[key] += 1
+    return alloc
+
+
+def sample_allocation(cells, n):
+    '''Return exact cell allocations, balancing found/empty when feasible.'''
+    if isinstance(n, bool) or not isinstance(n, (int, np.integer)):
+        raise ValueError("Sample size n must be an integer.")
+    if n <= 0:
+        raise ValueError("Sample size n must be positive.")
+    population = sum(len(group) for group in cells.values())
+    if population <= 0:
+        raise ValueError("Cannot sample an empty population.")
+    target = min(n, population)
+    if target < len(cells):
+        raise ValueError(
+            "Sample size {} is smaller than the {} nonempty strata; increase n "
+            "so every stratum has a positive inclusion probability.".format(
+                target, len(cells)))
+
+    sides = {
+        found: {key: group for key, group in cells.items() if key[1] == found}
+        for found in (True, False)
+    }
+    lower = {found: len(sides[found]) for found in sides}
+    upper = {found: sum(len(group) for group in sides[found].values())
+             for found in sides}
+
+    # Choose the closest feasible split to 50/50. The bounds guarantee at least
+    # one draw per cell and automatically transfer shortfalls from a sparse or
+    # absent side to the other side.
+    found_low = max(lower[True], target - upper[False])
+    found_high = min(upper[True], target - lower[False])
+    found_target = min(max(target // 2, found_low), found_high)
+    side_targets = {True: found_target, False: target - found_target}
+
+    allocation = {}
+    for found in (True, False):
+        allocation.update(_sqrt_allocation(sides[found], side_targets[found]))
+    if sum(allocation.values()) != target:
+        raise RuntimeError("Sampling allocation did not reach its exact target.")
+    return allocation
 
 def draw_sample(df, n, seed):
     ''' Stratify by (decade, whether the pipeline emitted an address).
@@ -87,53 +193,35 @@ def draw_sample(df, n, seed):
     which keeps small decades usable without letting them dominate. Each row
     carries the weight needed to undo all of this at scoring time.
     '''
+    if 'addresses' not in df.columns:
+        raise ValueError("Sampling requires an `addresses` column.")
     df = df.copy()
     df['_decade'] = df['year'].apply(decade) if 'year' in df.columns else None
-    df['_found'] = df.addresses.apply(lambda a: a is not None and len(a) > 0)
+    df['_found'] = df.addresses.apply(emitted_address)
 
     # Ads with no usable year still belong in the frame; they form their own
     # stratum rather than being silently dropped.
     cells = {}
     for (d, found), grp in df.groupby(['_decade', '_found'], dropna=False):
         if len(grp):
-            cells[(d, found)] = grp
+            normalized_decade = None if pd.isna(d) else int(d)
+            cells[(normalized_decade, bool(found))] = grp
 
+    allocation = sample_allocation(cells, n)
+    rng = np.random.RandomState(seed)
     chunks = []
-    for found in (True, False):
-        side = {k: v for k, v in cells.items() if k[1] == found}
-        if not side:
-            continue
-        target = n // 2
-        # sqrt allocation: compromise between proportional (buries small
-        # decades) and equal (over-weights them relative to what they can say).
-        roots = {k: math.sqrt(len(v)) for k, v in side.items()}
-        total_root = sum(roots.values())
-        alloc = {k: max(1, round(target * r / total_root)) for k, r in roots.items()}
-        # Never ask a cell for more rows than it has, then spend any shortfall
-        # on the cells that still have room, so the caller gets ~n rows.
-        alloc = {k: min(v, len(side[k])) for k, v in alloc.items()}
-        shortfall = target - sum(alloc.values())
-        for k in sorted(side, key=lambda k: -len(side[k])):
-            if shortfall <= 0:
-                break
-            room = len(side[k]) - alloc[k]
-            take = min(room, shortfall)
-            alloc[k] += take
-            shortfall -= take
-        for k, take in alloc.items():
-            if take <= 0:
-                continue
-            grp = side[k]
-            picked = grp.sample(take, random_state=seed)
-            picked = picked.assign(
-                stratum='{}|{}'.format(k[0] if k[0] is not None else 'no-year',
-                                       'found' if k[1] else 'empty'),
-                stratum_size=len(grp),
-                stratum_drawn=take,
-                design_weight=len(grp) / take)
-            chunks.append(picked)
+    for k in sorted(cells, key=_cell_sort_key):
+        take, grp = allocation[k], cells[k]
+        picked = grp.sample(take, random_state=rng)
+        picked = picked.assign(
+            stratum='{}|{}'.format(k[0] if k[0] is not None else 'no-year',
+                                   'found' if k[1] else 'empty'),
+            stratum_size=len(grp),
+            stratum_drawn=take,
+            design_weight=len(grp) / take)
+        chunks.append(picked)
 
-    sample = pd.concat(chunks).sample(frac=1, random_state=seed)
+    sample = pd.concat(chunks).sample(frac=1, random_state=rng)
     return sample
 
 
@@ -145,7 +233,7 @@ def write_template(sample, out_path, newspaper, population=None):
         cols['year'] = sample['year'].values
     cols['ad_text'] = [_shorten(t) for t in sample.raw_content]
     cols['pred_addresses'] = [
-        ' | '.join(sorted({_fmt_addr(a) for a in (arr if arr is not None else [])}))
+        ' | '.join(sorted({_fmt_addr(a) for a in address_values(arr)}))
         for arr in sample.addresses]
     cols['pred_wage'] = (sample['wage'].values if 'wage' in sample.columns
                          else [None] * len(sample))
@@ -234,6 +322,8 @@ def _codebook(newspaper, n, population=None):
         '- Every figure is **design-weighted** back to the corpus, so it estimates',
         '  the newspaper, not this sample. Precision, recall and coverage are each',
         '  reported overall; recall is additionally broken out by decade.',
+        '- Reported intervals are **approximate Kish-effective-n Wilson** intervals;',
+        '  they do not correct for coder nonresponse or coding error.',
     ]
     if population:
         lines += [
@@ -254,15 +344,17 @@ def wilson(k, n, z=1.96):
     the normal approximation does not. '''
     if n <= 0:
         return (float('nan'), float('nan'), float('nan'))
-    p = k / n
+    p = min(1.0, max(0.0, k / n))
     d = 1 + z**2 / n
     centre = (p + z**2 / (2 * n)) / d
     half = z * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / d
-    return p, max(0.0, centre - half), min(1.0, centre + half)
+    lo = 0.0 if p == 0.0 else max(0.0, centre - half)
+    hi = 1.0 if p == 1.0 else min(1.0, centre + half)
+    return p, lo, hi
 
 
 def weighted_rate(mask_num, mask_den, weights):
-    ''' Design-weighted proportion with a Kish effective-n Wilson interval.
+    ''' Design-weighted ratio with an approximate Kish-n Wilson interval.
 
     Returns (estimate, low, high, effective_n, raw_denominator_count).
     '''
@@ -270,7 +362,7 @@ def weighted_rate(mask_num, mask_den, weights):
     if len(w_den) == 0 or w_den.sum() == 0:
         return (float('nan'), float('nan'), float('nan'), 0.0, 0)
     w_num = weights[mask_den & mask_num]
-    p = w_num.sum() / w_den.sum()
+    p = min(1.0, max(0.0, w_num.sum() / w_den.sum()))
     # Kish: unequal weights cost variance, so the interval is computed at the
     # effective sample size rather than the raw row count.
     n_eff = (w_den.sum() ** 2) / (w_den ** 2).sum()
@@ -284,6 +376,8 @@ def _code(series):
 
 def validate_template(df):
     ''' Fail loudly on a template that cannot be scored correctly. '''
+    if df.empty:
+        raise SystemExit("The coding template contains no rows.")
     missing = [c for c in DESIGN_COLUMNS if c not in df.columns]
     if missing:
         raise SystemExit(
@@ -301,6 +395,39 @@ def validate_template(df):
             "{} row(s) have a missing or non-positive design_weight. A shifted "
             "column (often an unquoted comma in a free-text cell) is the usual "
             "cause; re-export from the spreadsheet with quoting enabled.".format(bad))
+
+    if df.stratum.isna().any() or df.stratum.astype(str).str.strip().eq('').any():
+        raise SystemExit("Every row must carry a nonempty stratum label.")
+    sizes = pd.to_numeric(df.stratum_size, errors='coerce')
+    drawn = pd.to_numeric(df.stratum_drawn, errors='coerce')
+    invalid_meta = (sizes.isna() | drawn.isna() | (sizes <= 0) | (drawn <= 0)
+                    | (drawn > sizes)
+                    | ~drawn.map(lambda value: float(value).is_integer())
+                    | ~sizes.map(lambda value: float(value).is_integer()))
+    if invalid_meta.any():
+        raise SystemExit(
+            "{} row(s) have invalid stratum_size/stratum_drawn metadata."
+            .format(int(invalid_meta.sum())))
+
+    expected_weight = sizes / drawn
+    if not np.allclose(w, expected_weight, rtol=1e-9, atol=1e-12):
+        raise SystemExit(
+            "design_weight must equal stratum_size / stratum_drawn on every row.")
+
+    metadata = pd.DataFrame({
+        'stratum': df.stratum.astype(str).str.strip(),
+        'size': sizes.astype(int), 'drawn': drawn.astype(int), 'weight': w})
+    for label, group in metadata.groupby('stratum', sort=False):
+        if (group['size'].nunique() != 1 or group['drawn'].nunique() != 1
+                or group['weight'].nunique() != 1):
+            raise SystemExit(
+                "Stratum {!r} has inconsistent design metadata.".format(label))
+        expected_rows = int(group['drawn'].iloc[0])
+        if len(group) != expected_rows:
+            raise SystemExit(
+                "Stratum {!r} records stratum_drawn={} but the template contains "
+                "{} row(s); rows were deleted or duplicated.".format(
+                    label, expected_rows, len(group)))
     for col in CODING_COLUMNS:
         vals = set(_code(df[col])) - {''}
         if col.startswith('truth_') and not col.endswith(('_address', '_wage')):
@@ -331,7 +458,7 @@ def score(df):
         n_total, int(coded.sum()), int(unclear.sum()),
         int(n_total - coded.sum() - unclear.sum())))
     print("Every figure is design-weighted back to the corpus; n_eff is Kish's "
-          "effective sample size.\n")
+          "effective sample size and intervals are approximate.\n")
 
     def line(label, num, den):
         p, lo, hi, n_eff, raw = weighted_rate(num, den, weights)
@@ -400,18 +527,18 @@ if __name__ == "__main__":
     parser.add_argument('--out', type=str, default='validation/sample.csv')
     args = parser.parse_args()
 
-    assert os.path.isfile(args.filepath), 'Invalid filepath.'
+    if not os.path.isfile(args.filepath):
+        parser.error('Invalid --filepath.')
 
     if args.mode == 'sample':
         df = pd.read_parquet(args.filepath)
-        assert 'addresses' in df.columns, "Needs an extract output with `addresses`."
+        if 'addresses' not in df.columns:
+            raise SystemExit("Needs an extract output with `addresses`.")
         pop = {'n': len(df),
-               'coverage': df.addresses.apply(
-                   lambda a: a is not None and len(a) > 0).mean()}
+               'coverage': df.addresses.apply(emitted_address).mean()}
         sample = draw_sample(df, args.n, args.seed)
         key = write_template(sample, args.out, newspaper_from_path(args.filepath), pop)
-        found = sample.design_weight[sample.addresses.apply(
-            lambda a: a is not None and len(a) > 0)]
+        found = sample.design_weight[sample.addresses.apply(emitted_address)]
         print("Wrote {} rows to {} (seed {}).".format(len(sample), args.out, args.seed))
         print("  {} strata; design weights {:.1f}-{:.1f} (each row stands for that "
               "many ads).".format(sample.stratum.nunique(),

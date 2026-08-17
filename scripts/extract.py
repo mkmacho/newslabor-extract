@@ -2,7 +2,6 @@ import time
 import os 
 import argparse
 import pandas as pd
-from math import ceil
 from common import (TextWrapper, USGeoData, add_filepath_suffix, time_now,
     newspaper_from_path, first_ad)
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -10,11 +9,11 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 class Newspaper(object):
     def __init__(self, newspaper, US_DATA, TEXT_HELP, min_pop=USGeoData.DEFAULT_MIN_POP):
-        assert newspaper in US_DATA.NEWSPAPER_TO_STATE_ID
+        if newspaper not in US_DATA.NEWSPAPER_TO_STATE_ID:
+            raise ValueError("Unsupported newspaper code: {!r}.".format(newspaper))
         self.newspaper = newspaper
-        # min_pop was accepted here but never forwarded, so the threshold could
-        # not actually be changed (AUDIT A11). It is the largest sampling
-        # restriction in the design, so it is now a real, documented knob.
+        # Population is the largest geographic candidate restriction, so keep
+        # the configured threshold explicit at load time.
         self.US_DATA = US_DATA.load(newspaper, min_pop=min_pop)
         self.TEXT_HELP = TEXT_HELP.set_state_abbreviations(
             self.US_DATA.US_STATES.state_id)
@@ -80,7 +79,8 @@ class Newspaper(object):
                         and not prefix.get('housenumber'):
                     continue
                 suffixes = self.city_state_options(tokens_list, i)
-                assert suffixes
+                if not suffixes:
+                    raise RuntimeError("Address candidate has no geographic suffixes.")
                 for suffix in suffixes:
                     address = prefix | suffix
                     if not address in address_dicts_list: 
@@ -179,7 +179,8 @@ class Newspaper(object):
 
 _WORKER_NEWSPAPER = None
 
-def _init_worker(newspaper:str, aux_dir:str):
+def _init_worker(newspaper:str, aux_dir:str,
+        min_pop:int=USGeoData.DEFAULT_MIN_POP):
     ''' Build the Newspaper helper once per worker process.
 
     ProcessPoolExecutor pickles whatever callable it is given for *every* task;
@@ -187,7 +188,7 @@ def _init_worker(newspaper:str, aux_dir:str):
     US city table with each row, which is what exhausted memory on the cluster.
     '''
     global _WORKER_NEWSPAPER
-    _WORKER_NEWSPAPER = build_newspaper(newspaper, aux_dir)
+    _WORKER_NEWSPAPER = build_newspaper(newspaper, aux_dir, min_pop=min_pop)
 
 def _worker_extract(text_and_year):
     return _WORKER_NEWSPAPER.extract(*text_and_year)
@@ -206,9 +207,7 @@ def build_newspaper(newspaper:str, aux_dir:str, min_pop:int=USGeoData.DEFAULT_MI
             os.path.join(aux_dir, "neighbors-states.csv"),
             os.path.join(aux_dir, "geo/uszips.csv")
         ),
-        TEXT_HELP=TextWrapper(
-            os.path.join(aux_dir, "dictionary_list.txt")
-        )
+        TEXT_HELP=TextWrapper()
     )
 
 
@@ -224,6 +223,66 @@ def multithreading(func, args, max_workers:int=None):
     with ThreadPoolExecutor(max_workers) as ex:
         res = ex.map(func, args)
     return list(res)
+
+
+def iter_batch_bounds(nrows:int, batch_size:int, skip:int=0):
+    '''Yield (start, stop, checkpoint_stop) for resumable extraction batches.
+
+    Checkpoint filenames retain the producer's regular batch boundary even for a
+    short final batch. That is the convention merge-batch.py consumes. Resume is
+    intentionally restricted to whole batches: accepting an arbitrary row offset
+    would produce a checkpoint whose filename claims rows it does not contain.
+    '''
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if skip < 0 or skip > nrows:
+        raise ValueError("skip must lie between 0 and nrows")
+    if skip % batch_size:
+        raise ValueError("skip must be a whole multiple of batch_size")
+    for start in range(0, nrows, batch_size):
+        stop = min(start + batch_size, nrows)
+        if stop <= skip:
+            continue
+        yield start, stop, start + batch_size
+
+
+def extract_one_batch(sample, years, start:int, stop:int, newspaper,
+        extract_address=True, extract_wage=False, executor=None,
+        chunksize:int=1000):
+    '''Compute the requested derived columns for one row batch.'''
+    indices = sample.index[start:stop]
+    raw = sample.raw_content.iloc[start:stop]
+    out = pd.DataFrame(index=indices)
+
+    if extract_address:
+        args = list(zip(raw.to_list(), years[start:stop], strict=True))
+        addresses = (list(executor.map(_worker_extract, args,
+                         chunksize=chunksize)) if executor else
+                     [newspaper.extract(text, year) for text, year in args])
+        out['addresses'] = addresses
+
+    if extract_wage:
+        texts = raw.to_list()
+        records = (list(executor.map(_worker_employer_info, texts,
+                       chunksize=chunksize)) if executor else
+                   [newspaper.employer_info(text) for text in texts])
+        out = out.join(pd.DataFrame(records, index=indices))
+    return out
+
+
+def assign_batch_results(sample, results):
+    '''Attach one derived batch without retaining a second full-size frame.'''
+    locations = sample.index.get_indexer(results.index)
+    if (locations < 0).any():
+        raise ValueError("Batch results contain row ids outside the input sample.")
+    for column in results.columns:
+        if column not in sample.columns:
+            sample[column] = pd.Series(index=sample.index, dtype='object')
+        # Assign through the backing object array. Pandas 1.5 warns that the
+        # future semantics of ``.loc[:, column] =`` will change; positional
+        # assignment is both stable and O(batch) rather than copying the full
+        # 34M-row column for every checkpoint.
+        sample[column].to_numpy(copy=False)[locations] = results[column].to_numpy()
 
 
 if __name__ == "__main__":
@@ -245,30 +304,46 @@ if __name__ == "__main__":
         help="Filepath to auxiliary directory.")
     parser.add_argument('-o', '--output_dir', type=str, default='./output',
         help="Filepath to output directory.")
+    parser.add_argument('--write_csv', type=int, default=0,
+        help="Also write a CSV copy containing source text (default: disabled).")
     args = parser.parse_args()
 
-    assert os.path.isdir(args.aux_dir), 'Invalid filepath to auxilliary files.'
-    assert os.path.isfile(args.filepath), 'Invalid filepath to data CSV.'
+    if not os.path.isdir(args.aux_dir):
+        parser.error('Invalid filepath to auxiliary files.')
+    if not os.path.isfile(args.filepath):
+        parser.error('Invalid filepath to data CSV.')
+    if args.batch_size <= 0:
+        raise SystemExit('--batch_size must be positive.')
+    if args.skip < 0:
+        raise SystemExit('--skip must be non-negative.')
     # The output directory is ours to create; asserting on it only
     # made a first run fail on a path the user never chose.
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load data
     sample = pd.read_csv(args.filepath, nrows=args.nrows, index_col=[0])
+    if not len(sample):
+        raise SystemExit('Input data is empty.')
+    if not sample.index.is_unique:
+        raise SystemExit('Input row index contains duplicates.')
     sample.raw_content = sample.raw_content.fillna('')
     print("Will process sample of {} observations.".format(len(sample)))
 
     # Load Newspaper class with helper classes
     paper = newspaper_from_path(args.filepath)
     NEWSPAPER = build_newspaper(paper, args.aux_dir, min_pop=args.min_pop)
-    POOL_KWARGS = {'max_workers':args.nworkers, 'initializer':_init_worker,
-        'initargs':(paper, args.aux_dir)}
 
     # Predict
     print("Beginning extractions using {} processing ({} workers) at {}.".format(
         'multi' if args.multiprocessing else 'serial', args.nworkers or 1, time_now()))
     start_time = time.time()
     args.batch_size = min(args.batch_size, len(sample))
+    if args.skip > len(sample):
+        raise SystemExit('--skip exceeds the input row count.')
+    if args.skip % args.batch_size:
+        raise SystemExit('--skip must be a whole multiple of --batch_size.')
+
+    years = [None] * len(sample)
     if args.extract_address:
         print("Extracting addresses...")
         # `year` gates the zipcode scan (ZIP codes postdate 1963). Absent or
@@ -283,33 +358,37 @@ if __name__ == "__main__":
         else:
             print("  No `year` column: zipcode scan enabled for all ads.")
             years = [None] * len(sample)
-        if args.multiprocessing:
-            sample['addresses'] = multiprocessing(_worker_extract,
-                list(zip(sample.raw_content, years)), **POOL_KWARGS)
-        else:
-            sample['addresses'] = [NEWSPAPER.extract(t, y)
-                for t, y in zip(sample.raw_content, years)]
-
     if args.extract_wage:
         print("Extracting wages...")
-        wage_batches = []
-        for batch_idx in range(ceil(len(sample) / args.batch_size)):
-            if args.skip >= (batch_idx+1)*args.batch_size: continue
-            batch_slice = slice(batch_idx*args.batch_size, (batch_idx+1)*args.batch_size)
-            if args.multiprocessing:
-                records = multiprocessing(_worker_employer_info,
-                    sample.raw_content.iloc[batch_slice].to_list(), **POOL_KWARGS)
-            else:
-                records = sample.raw_content.iloc[batch_slice].apply(
-                    NEWSPAPER.employer_info).to_list()
-            wages_batch = pd.DataFrame(records, index=sample.index[batch_slice])
-            wage_batches.append(wages_batch)
+
+    executor = None
+    if args.multiprocessing and (args.extract_address or args.extract_wage):
+        executor = ProcessPoolExecutor(max_workers=args.nworkers,
+            initializer=_init_worker,
+            initargs=(paper, args.aux_dir, args.min_pop))
+    try:
+        for batch_start, batch_stop, checkpoint_stop in iter_batch_bounds(
+                len(sample), args.batch_size, args.skip):
+            results = extract_one_batch(sample, years, batch_start, batch_stop,
+                NEWSPAPER, extract_address=bool(args.extract_address),
+                extract_wage=bool(args.extract_wage), executor=executor)
+            if results.empty and not len(results.columns):
+                continue
+            results.to_parquet(add_filepath_suffix(args.output_dir, paper,
+                n=checkpoint_stop, suffix='extract-batch'), compression='gzip')
+            assign_batch_results(sample, results)
             print("Processed ads {}-{} at {}...".format(
-                batch_idx*args.batch_size,(batch_idx+1)*args.batch_size, time_now()))
-            wages_batch.to_parquet(add_filepath_suffix(args.output_dir, paper,
-                n=(batch_idx+1)*args.batch_size, suffix='extract-batch'), compression='gzip')
-        if wage_batches:
-            sample = sample.join(pd.concat(wage_batches))
+                batch_start, batch_stop, time_now()))
+    finally:
+        if executor is not None:
+            executor.shutdown()
+
+    # Full runs recover native numeric/bool dtypes after the object-typed slots
+    # used for incremental assignment. Partial resume outputs retain missing rows.
+    if not args.skip:
+        for column in sample.columns:
+            if column not in ('addresses', 'wage'):
+                sample[column] = sample[column].infer_objects()
 
 
     # A resumed run (--skip) holds NaN for the skipped rows, so it must not reuse
@@ -317,11 +396,9 @@ if __name__ == "__main__":
     out_suffix = 'extract' if not args.skip else 'extract-from{}'.format(args.skip)
     sample.to_parquet(add_filepath_suffix(args.output_dir, paper, n=args.nrows,
         suffix=out_suffix), compression='gzip')
-    sample.to_csv(add_filepath_suffix(args.output_dir, paper, n=args.nrows,
-        suffix=out_suffix, ext='csv'))
+    if args.write_csv:
+        sample.to_csv(add_filepath_suffix(args.output_dir, paper, n=args.nrows,
+            suffix=out_suffix, ext='csv'))
     elapsed = time.time() - start_time
     print("Completed extractions at {} in {} minutes ({} seconds).".format(
         time_now(), round(elapsed / 60, 2), round(elapsed)))
-
-
-

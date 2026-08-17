@@ -2,25 +2,45 @@ name: tests
 
 on:
   push:
-    branches: [main, 'audit/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11']
     steps:
-      - uses: actions/checkout@v4
-
-      # 3.11 is the ceiling: pandas 1.5.3 publishes no wheels above it, and the
-      # pipeline needs 3.9+ for the dict-merge operator in extract.py.
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: '3.11'
+          persist-credentials: false
+
+      # Current dependency pins support Python 3.10-3.11.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Audit dependency advisories
+        if: matrix.python-version == '3.11'
+        run: |
+          pip install pip-audit==2.10.1
+          pip-audit -r requirements.txt
 
       - name: Run the test suite
         # The suite makes no network calls — conftest.py replaces the HTTP
@@ -30,13 +50,7 @@ jobs:
           GEOAPIFY_API_KEY: not-a-real-key
         run: python -m pytest scripts/tests/ -v
 
-      - name: Smoke-test the pipeline end to end
-        # The whole bundled sample, proving the CLI and the offline county
-        # derivation work from a clean checkout with no API key. The corpus is
-        # generated to span 1916-2003, so both sides of the 1963 ZIP-code gate
-        # are exercised.
-        run: |
-          python scripts/extract.py --filepath=./test_data/NJG-sample.csv \
-            --extract_wage=1 --output_dir=./ci-output
-          python scripts/recompute.py --from_addresses \
-            --filepath=./ci-output/NJG-extract-all.gzip --output_dir=./ci-output
+      - name: Run the documented offline demo
+        # Includes extraction, ZIP-based county/FIPS derivation, and creation of
+        # a weighted validation-coding sample. No API key or live geocoder call.
+        run: bash scripts/demo.sh ./ci-output
