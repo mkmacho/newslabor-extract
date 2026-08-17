@@ -690,6 +690,41 @@ def test_v7_template_without_design_columns_is_refused():
         validate.score(df)
 
 
+def test_s1_sample_corpus_exercises_the_audited_paths():
+    """S1: the bundled corpus is synthetic, because the real advertisements are
+    third-party copyright. It is only useful if it still contains the shapes the
+    audit found bugs in, so pin them."""
+    path = os.path.join(REPO_ROOT, "test_data", "NJG-sample.csv")
+    assert os.path.isfile(path), "bundled sample corpus is missing"
+    df = pd.read_csv(path, index_col=[0])
+    text = df.raw_content.fillna("")
+
+    assert len(df) >= 500, "corpus too small to be a useful demo"
+    assert (df.year < 1963).any() and (df.year >= 1963).any(), \
+        "corpus must span both sides of the ZIP-code gate"
+    assert text.str.contains(common.AD_SEPARATOR, regex=False).any(), \
+        "no concatenated multi-ad records, so first_ad is never exercised"
+    # the low-precision markers must appear, since they are why the gate exists
+    for marker in ("Court", "Circuit"):
+        assert text.str.contains(marker, regex=False).any(), \
+            "corpus never uses the %r marker" % marker
+    # PO-box ZIPs are the reason GeoNames is a dependency at all
+    assert text.str.contains("23501", regex=False).any(), \
+        "corpus contains no PO-box ZIP code"
+    # ground truth is what lets the harness be demonstrated without a coder
+    for col in ("_truth_is_job_ad", "_truth_has_address", "_truth_has_wage"):
+        assert col in df.columns, "missing ground-truth column %s" % col
+
+
+def test_s2_sample_corpus_is_reproducible():
+    """S2: same seed, same corpus — otherwise the documented demo numbers drift."""
+    import make_sample_corpus as mk
+    import random
+    a = [mk.make_row(random.Random(7), i) for i in range(25)]
+    b = [mk.make_row(random.Random(7), i) for i in range(25)]
+    assert a == b, "generator is not deterministic for a fixed seed"
+
+
 def test_o8_suite_cannot_reach_the_network():
     """O8: the autouse fixture in conftest.py must make a real request impossible,
     so running the suite with a live key in the environment cannot spend credit."""

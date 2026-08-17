@@ -13,7 +13,6 @@ logs/
 *-recomputed-*.gzip
 *-offline-county-*.gzip
 *-final-*.gzip
-!test_data/NJG-extract-all.gzip
 
 # CI scratch
 ci-output/

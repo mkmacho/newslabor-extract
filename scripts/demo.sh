@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end demonstration on the bundled sample. No API key, no network.
 #
-# Runs the whole pipeline over 10,994 real Norfolk Journal & Guide ads:
+# Runs the whole pipeline over 2,000 synthetic advertisements:
 #   extract   raw OCR text        -> candidate addresses + wages
 #   recompute candidate addresses -> counties and FIPS codes, offline
 #   validate  extract output      -> a stratified accuracy-coding sample
@@ -33,13 +33,13 @@ fi
 mkdir -p "$OUT"
 echo
 echo "=============================================================="
-echo " newspaper-extract demo - 10,994 real ads, no API key needed"
+echo " newspaper-extract demo - 2,000 ads, no API key needed"
 echo "=============================================================="
 
 echo
 echo "[1/4] Extracting addresses and wages from raw OCR text..."
 "$PY" scripts/extract.py \
-  --filepath=./test_data/NJG.csv \
+  --filepath=./test_data/NJG-sample.csv \
   --aux_dir=./auxiliary_files \
   --output_dir="$OUT" \
   --extract_wage=1 \

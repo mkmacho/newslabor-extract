@@ -31,12 +31,12 @@ jobs:
         run: python -m pytest scripts/tests/ -v
 
       - name: Smoke-test the pipeline end to end
-        # A slice of the bundled sample, proving the CLI and the offline county
-        # derivation work from a clean checkout with no API key. 3,000 rows spans
-        # 1916-1976, so it exercises both sides of the 1963 ZIP-code gate; a
-        # smaller slice is entirely pre-ZIP and would report zero counties.
+        # The whole bundled sample, proving the CLI and the offline county
+        # derivation work from a clean checkout with no API key. The corpus is
+        # generated to span 1916-2003, so both sides of the 1963 ZIP-code gate
+        # are exercised.
         run: |
-          python scripts/extract.py --filepath=./test_data/NJG.csv \
-            -n 3000 --extract_wage=1 --output_dir=./ci-output
+          python scripts/extract.py --filepath=./test_data/NJG-sample.csv \
+            --extract_wage=1 --output_dir=./ci-output
           python scripts/recompute.py --from_addresses \
-            --filepath=./ci-output/NJG-extract-3000.gzip --output_dir=./ci-output
+            --filepath=./ci-output/NJG-extract-all.gzip --output_dir=./ci-output
