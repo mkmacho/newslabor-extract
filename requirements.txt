@@ -1,5 +1,5 @@
 pandas==1.5.3
-spacy==3.7.4
+spacy==3.8.15
 thefuzz==0.22.1
 pyzipcode==3.0.1
 symspellpy==6.7.7
