@@ -134,10 +134,10 @@ negative cases such as non-job ads.
   security updates are enabled. Optional non-provider secret patterns and token
   validity checks are not enabled or available for this repository.
 
-After this documentation update is published, `main` is to require pull requests,
-the Python 3.10 and 3.11 checks, resolved conversations, and linear history;
-force pushes and branch deletion are blocked. The rule requires zero approving
-reviews.
+`main` requires pull requests, the Python 3.10 and 3.11 checks, resolved
+conversations, and linear history; force pushes and branch deletion are blocked.
+The rule requires zero approving reviews so the repository remains maintainable
+by one person without bypassing its automated checks.
 
 ## Remaining external checks
 
