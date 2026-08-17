@@ -333,9 +333,9 @@ if __name__ == "__main__":
     # Load US geo-data
     US_DATA = USGeoData(
         os.path.join(args.aux_dir, "states.csv"),
-        os.path.join(args.aux_dir, "simplemaps/uscities.csv"),
+        os.path.join(args.aux_dir, "geo/uscities.csv"),
         os.path.join(args.aux_dir, "neighbors-states.csv"),
-        os.path.join(args.aux_dir, "simplemaps/uszips.csv")
+        os.path.join(args.aux_dir, "geo/uszips.csv")
     ).load(newspaper)
 
     os.environ['GEOAPIFY_URL'] = args.geoapify_url # Note: pro URL would be 'https://bk01.geoapify.net'

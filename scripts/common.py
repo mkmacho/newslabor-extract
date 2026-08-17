@@ -429,7 +429,16 @@ class USGeoData(object):
                 uszips.county_fips[have_fips].str.zfill(5))))
         print("Loaded USA geo-data.")
 
-    def load(self, newspaper:str, min_pop=50000):
+    # Population threshold for a place to be a candidate city. Expressed in ACS
+    # *place* population. The previous SimpleMaps table shipped urban-agglomeration
+    # figures 4-8x larger (Richmond VA 1,073,223 against an actual city of 227,595),
+    # so its 50,000 gate corresponds to roughly 15,000 here. Measured on NJG, 15,000
+    # reproduces and slightly exceeds the old candidate coverage; keeping 50,000
+    # against place populations would silently tighten the largest sampling
+    # restriction in the design. See AUDIT.md.
+    DEFAULT_MIN_POP = 15000
+
+    def load(self, newspaper:str, min_pop=DEFAULT_MIN_POP):
         # The compute_* methods are deliberately named apart from the attributes
         # they fill: assigning results onto the method names made load() a
         # one-shot operation (a second call raised "'list' object is not callable").
@@ -503,12 +512,12 @@ class USGeoData(object):
         return self.US_STATES.loc[
             self.US_STATES.state_id.isin(nearby_state_ids)].state_name.to_list()
 
-    def big_cities_in_state(self, state_name:str, min_pop:int=50000):
+    def big_cities_in_state(self, state_name:str, min_pop:int=DEFAULT_MIN_POP):
         return self.US_CITIES[(self.US_CITIES.state_name == state_name) & (
             self.US_CITIES.population >= min_pop)].sort_values(
                 by=['population'], ascending=False).city.to_list()
 
-    def compute_biggest_nearby_cities(self, nearby_state_ids:list, min_pop:int=50000):
+    def compute_biggest_nearby_cities(self, nearby_state_ids:list, min_pop:int=DEFAULT_MIN_POP):
         ''' Return the set of biggest cities in given states.
 
         A set is returned for O(1) membership tests, but it must never be

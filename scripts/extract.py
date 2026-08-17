@@ -9,10 +9,13 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 
 class Newspaper(object):
-    def __init__(self, newspaper, US_DATA, TEXT_HELP, min_pop=50000):
+    def __init__(self, newspaper, US_DATA, TEXT_HELP, min_pop=USGeoData.DEFAULT_MIN_POP):
         assert newspaper in US_DATA.NEWSPAPER_TO_STATE_ID
         self.newspaper = newspaper
-        self.US_DATA = US_DATA.load(newspaper)
+        # min_pop was accepted here but never forwarded, so the threshold could
+        # not actually be changed (AUDIT A11). It is the largest sampling
+        # restriction in the design, so it is now a real, documented knob.
+        self.US_DATA = US_DATA.load(newspaper, min_pop=min_pop)
         self.TEXT_HELP = TEXT_HELP.set_state_abbreviations(
             self.US_DATA.US_STATES.state_id)
         print("Newspaper class loaded.")
@@ -192,15 +195,16 @@ def _worker_extract(text_and_year):
 def _worker_employer_info(ad_text):
     return _WORKER_NEWSPAPER.employer_info(ad_text)
 
-def build_newspaper(newspaper:str, aux_dir:str):
+def build_newspaper(newspaper:str, aux_dir:str, min_pop:int=USGeoData.DEFAULT_MIN_POP):
     ''' Load a Newspaper with its US-geo and text helpers from `aux_dir`. '''
     return Newspaper(
         newspaper=newspaper,
+        min_pop=min_pop,
         US_DATA=USGeoData(
             os.path.join(aux_dir, "states.csv"),
-            os.path.join(aux_dir, "simplemaps/uscities.csv"),
+            os.path.join(aux_dir, "geo/uscities.csv"),
             os.path.join(aux_dir, "neighbors-states.csv"),
-            os.path.join(aux_dir, "simplemaps/uszips.csv")
+            os.path.join(aux_dir, "geo/uszips.csv")
         ),
         TEXT_HELP=TextWrapper(
             os.path.join(aux_dir, "dictionary_list.txt")
@@ -234,6 +238,9 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--skip', type=int, default=0, help="Ads to skip at beginning.")
     parser.add_argument('-w', '--nworkers', type=int, default=None, help="Number workers to use.")
     parser.add_argument('-b', '--batch_size', type=int, default=100000, help="Batch size.")
+    parser.add_argument('--min_pop', type=int, default=USGeoData.DEFAULT_MIN_POP,
+        help="Minimum place population for a city to be a candidate. This is the "
+             "largest sampling restriction in the design; see AUDIT.md.")
     parser.add_argument('-a', '--aux_dir', type=str, default='./auxiliary_files',
         help="Filepath to auxiliary directory.")
     parser.add_argument('-o', '--output_dir', type=str, default='./output',
@@ -253,7 +260,7 @@ if __name__ == "__main__":
 
     # Load Newspaper class with helper classes
     paper = newspaper_from_path(args.filepath)
-    NEWSPAPER = build_newspaper(paper, args.aux_dir)
+    NEWSPAPER = build_newspaper(paper, args.aux_dir, min_pop=args.min_pop)
     POOL_KWARGS = {'max_workers':args.nworkers, 'initializer':_init_worker,
         'initargs':(paper, args.aux_dir)}
 

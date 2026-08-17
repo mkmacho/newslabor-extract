@@ -186,9 +186,9 @@ if __name__ == "__main__":
     newspaper = newspaper_from_path(args.filepath)
     US_DATA = USGeoData(
         os.path.join(args.aux_dir, "states.csv"),
-        os.path.join(args.aux_dir, "simplemaps/uscities.csv"),
+        os.path.join(args.aux_dir, "geo/uscities.csv"),
         os.path.join(args.aux_dir, "neighbors-states.csv"),
-        os.path.join(args.aux_dir, "simplemaps/uszips.csv")
+        os.path.join(args.aux_dir, "geo/uszips.csv")
     ).load(newspaper)
 
     st = time.time()

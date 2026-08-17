@@ -68,9 +68,9 @@ def main(args):
     newspaper = newspaper_from_path(args.geo)
     US_DATA = USGeoData(
         os.path.join(args.aux_dir, "states.csv"),
-        os.path.join(args.aux_dir, "simplemaps/uscities.csv"),
+        os.path.join(args.aux_dir, "geo/uscities.csv"),
         os.path.join(args.aux_dir, "neighbors-states.csv"),
-        os.path.join(args.aux_dir, "simplemaps/uszips.csv")
+        os.path.join(args.aux_dir, "geo/uszips.csv")
     ).load(newspaper)
 
     geo = pd.read_parquet(args.geo)

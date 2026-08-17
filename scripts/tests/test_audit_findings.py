@@ -30,7 +30,7 @@ from extract import Newspaper  # noqa: E402
 def us_data():
     return common.USGeoData(
         os.path.join(AUX_DIR, "states.csv"),
-        os.path.join(AUX_DIR, "simplemaps/uscities.csv"),
+        os.path.join(AUX_DIR, "geo/uscities.csv"),
         os.path.join(AUX_DIR, "neighbors-states.csv"),
     ).load("NJG")
 
@@ -40,9 +40,9 @@ def us_data_with_zips():
     """Loaded the way the scripts load it in production — with uszips.csv."""
     return common.USGeoData(
         os.path.join(AUX_DIR, "states.csv"),
-        os.path.join(AUX_DIR, "simplemaps/uscities.csv"),
+        os.path.join(AUX_DIR, "geo/uscities.csv"),
         os.path.join(AUX_DIR, "neighbors-states.csv"),
-        os.path.join(AUX_DIR, "simplemaps/uszips.csv"),
+        os.path.join(AUX_DIR, "geo/uszips.csv"),
     ).load("NJG")
 
 
@@ -55,7 +55,7 @@ def text_help():
 def newspaper(text_help):
     us = common.USGeoData(
         os.path.join(AUX_DIR, "states.csv"),
-        os.path.join(AUX_DIR, "simplemaps/uscities.csv"),
+        os.path.join(AUX_DIR, "geo/uscities.csv"),
         os.path.join(AUX_DIR, "neighbors-states.csv"),
     )
     return Newspaper("NJG", us, text_help)
@@ -93,7 +93,7 @@ def test_a1_geoapify_keeps_best_confidence_feature(us_data, monkeypatch):
 def us_data_lat():
     return common.USGeoData(
         os.path.join(AUX_DIR, "states.csv"),
-        os.path.join(AUX_DIR, "simplemaps/uscities.csv"),
+        os.path.join(AUX_DIR, "geo/uscities.csv"),
         os.path.join(AUX_DIR, "neighbors-states.csv"),
     ).load("LAT")
 

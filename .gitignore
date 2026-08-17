@@ -17,3 +17,6 @@ logs/
 
 # CI scratch
 ci-output/
+
+# Source downloads for scripts/build_geo_reference.py
+build-cache/
