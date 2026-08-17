@@ -33,7 +33,7 @@ fi
 mkdir -p "$OUT"
 echo
 echo "=============================================================="
-echo " newspaper-extract demo - 2,000 ads, no API key needed"
+echo " newslabor-extract demo - 2,000 ads, no API key needed"
 echo "=============================================================="
 
 echo
