@@ -174,7 +174,7 @@ if __name__ == "__main__":
         help="Derive counties from the `addresses` column instead of stored responses.")
     parser.add_argument('-n', '--nrows', type=int, default=None)
     parser.add_argument('-a', '--aux_dir', type=str, default='./auxiliary_files')
-    parser.add_argument('-o', '--output_dir', type=str, default='.')
+    parser.add_argument('-o', '--output_dir', type=str, default='./output')
     args = parser.parse_args()
 
     assert os.path.isfile(args.filepath), 'Invalid filepath to data.'

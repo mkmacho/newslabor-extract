@@ -136,7 +136,7 @@ if __name__ == "__main__":
     parser.add_argument('--wage', type=str, default=None,
         help="Optional extract output carrying wage columns.")
     parser.add_argument('-a', '--aux_dir', type=str, default='./auxiliary_files')
-    parser.add_argument('-o', '--output_dir', type=str, default='.')
+    parser.add_argument('-o', '--output_dir', type=str, default='./output')
     parser.add_argument('--write_csv', type=int, default=0,
         help="Also write a CSV copy (large: these files carry full ad text).")
     args = parser.parse_args()

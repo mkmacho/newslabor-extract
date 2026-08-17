@@ -555,50 +555,142 @@ def test_v1_wilson_interval_behaves_at_the_edges():
     assert all(math.isnan(x) for x in validate.wilson(0, 0))
 
 
+def _fake_corpus(n=400, coverage=0.6):
+    """A corpus where the pipeline's hit rate differs from 50%, so an unweighted
+    estimator drawn from a 50/50 sample is provably wrong."""
+    rows = []
+    for i in range(n):
+        found = i < int(n * coverage)
+        rows.append({
+            'id': i,
+            'year': 1930 + (i % 8) * 10,
+            'raw_content': 'cook wanted apply 5 Main Street Norfolk',
+            'addresses': [{'street': 'Main Street'}] if found else [],
+            'wage': None,
+        })
+    return pd.DataFrame(rows)
+
+
 def test_v2_sample_includes_ads_the_pipeline_missed(tmp_path):
     """V2: a sample drawn only from ads that produced an address cannot contain
-    a false negative, so recall would be unmeasurable. Both sides must appear."""
+    a false negative, so recall would be unmeasurable. Both sides must appear,
+    and each row must carry the weight needed to undo the over-sampling."""
     import validate
-    df = pd.DataFrame({
-        'id': range(40),
-        'year': [1930 + (i % 8) * 10 for i in range(40)],
-        'raw_content': ['cook wanted apply 5 Main Street Norfolk'] * 40,
-        'addresses': [[{'street': 'Main Street'}] if i % 2 else [] for i in range(40)],
-        'wage': [None] * 40,
-    })
+    df = _fake_corpus(40, coverage=0.5)
     sample = validate.draw_sample(df, 20, seed=1)
     found = sample.addresses.apply(lambda a: len(a) > 0)
     assert found.any(), "sample contains no ads with a prediction"
     assert (~found).any(), "sample contains no empty ads — recall unmeasurable"
+    for col in validate.DESIGN_COLUMNS:
+        assert col in sample.columns, "missing design column %s" % col
+    assert (sample.design_weight > 0).all()
     out = tmp_path / "s.csv"
     key = validate.write_template(sample, str(out), "NJG")
     written = pd.read_csv(out, keep_default_na=False)
-    for col in validate.CODING_COLUMNS:
+    for col in list(validate.CODING_COLUMNS) + validate.DESIGN_COLUMNS:
         assert col in written.columns
     assert 'ad_text' in written.columns and written.ad_text.str.len().gt(0).all()
     assert os.path.isfile(key), "codebook not written"
 
 
+def test_v4_design_weights_recover_the_population_rate():
+    """V4: the harness deliberately over-samples the empty side, so the raw
+    sample mean estimates accuracy under a 50/50 mixture rather than the
+    corpus. The weights must undo that."""
+    import validate
+    df = _fake_corpus(400, coverage=0.75)
+    sample = validate.draw_sample(df, 100, seed=3)
+    pred = sample.addresses.apply(lambda a: len(a) > 0)
+    w = sample.design_weight
+    unweighted = pred.mean()
+    weighted = (w * pred).sum() / w.sum()
+    assert abs(weighted - 0.75) < 0.02, (
+        "weighted coverage %.3f should recover the corpus rate 0.75" % weighted)
+    assert abs(unweighted - 0.75) > 0.05, (
+        "test is not exercising the bias: unweighted came out at %.3f" % unweighted)
+
+
+def test_v5_sample_size_is_honoured():
+    """V5: --n is a promise. Earlier allocation under-delivered badly (200 -> 188,
+    50 -> 40) and two different --n values could yield the same sample."""
+    import validate
+    df = _fake_corpus(2000, coverage=0.55)
+    for n in (50, 100, 200):
+        got = len(validate.draw_sample(df, n, seed=2))
+        assert abs(got - n) <= 0.1 * n, "asked for %d, got %d" % (n, got)
+
+
 def test_v3_scoring_separates_precision_from_recall(capsys):
     """V3: an emitted-but-wrong address must hurt precision, and a missed
-    address must hurt recall; the two must not be conflated."""
+    address must hurt recall; the two must not be conflated. An emitted address
+    the coder marked wrong must NOT count as a successful recall."""
     import validate
     df = pd.DataFrame({
         'year': [1970] * 4,
         'pred_addresses': ['5 Main St', '', '9 Oak St', ''],
-        'pred_wage': [None] * 4,
-        'truth_has_address': ['y', 'y', 'n', 'n'],
+        'pred_wage': [''] * 4,
+        'stratum': ['1970|found', '1970|empty', '1970|found', '1970|empty'],
+        'stratum_size': [10] * 4,
+        'stratum_drawn': [2] * 4,
+        'design_weight': [5.0] * 4,
+        'truth_has_address': ['y', 'y', 'y', 'n'],
         'truth_is_job_ad': ['y'] * 4,
         'truth_address_is_worksite': ['y', '', '', ''],
         'truth_has_wage': ['n'] * 4,
+        'truth_address': [''] * 4, 'truth_wage': [''] * 4, 'coder_notes': [''] * 4,
+        # row 2 emitted an address the coder judged WRONG
         'pred_address_correct': ['y', '', 'n', ''],
         'pred_wage_correct': [''] * 4,
     })
     validate.score(df)
     out = capsys.readouterr().out
-    # 2 emitted, 1 right -> precision 50%; 2 truly have one, 1 found -> recall 50%
+    # emitted: rows 0 and 2; correct: row 0 -> precision 50%
     assert "precision (strict)" in out and "50.0%" in out
-    assert "recall" in out
+    # truly have an address: rows 0,1,2; recalled correctly: only row 0 -> 33.3%
+    assert "recall (emitted and correct)" in out and "33.3%" in out
+
+
+def test_v6_blank_judgement_is_not_scored_as_wrong(capsys):
+    """V6: an uncoded judgement cell means "not yet coded", not "the pipeline
+    got it wrong". Scoring blanks as failures reported a perfect extraction as
+    0% precision."""
+    import validate
+    df = pd.DataFrame({
+        'year': [1970] * 2,
+        'pred_addresses': ['5 Main St', '9 Oak St'],
+        'pred_wage': [''] * 2,
+        'stratum': ['1970|found'] * 2, 'stratum_size': [10] * 2,
+        'stratum_drawn': [2] * 2, 'design_weight': [5.0] * 2,
+        'truth_has_address': ['y', 'y'],
+        'truth_is_job_ad': ['y'] * 2,
+        'truth_address_is_worksite': [''] * 2,
+        'truth_has_wage': ['n'] * 2,
+        'truth_address': [''] * 2, 'truth_wage': [''] * 2, 'coder_notes': [''] * 2,
+        'pred_address_correct': ['y', ''],   # second row simply not coded yet
+        'pred_wage_correct': [''] * 2,
+    })
+    validate.score(df)
+    out = capsys.readouterr().out
+    assert "100.0%" in out, "the one coded row was correct; precision must be 100%"
+
+
+def test_v7_template_without_design_columns_is_refused():
+    """V7: scoring a template that lost its design columns would silently report
+    the sampling design instead of the pipeline. It must refuse."""
+    import validate
+    df = pd.DataFrame({
+        'pred_addresses': ['5 Main St'], 'pred_wage': [''],
+        'truth_has_address': ['y'], 'truth_is_job_ad': ['y'],
+        'truth_address_is_worksite': [''], 'truth_has_wage': ['n'],
+        'truth_address': [''], 'truth_wage': [''],
+        'pred_address_correct': ['y'], 'pred_wage_correct': [''],
+        'coder_notes': [''],
+    })
+    with pytest.raises(SystemExit, match="design columns"):
+        validate.score(df)
+
+
+def test_o8_suite_cannot_reach_the_network():
     """O8: the autouse fixture in conftest.py must make a real request impossible,
     so running the suite with a live key in the environment cannot spend credit."""
     with pytest.raises(AssertionError, match="never hit the network"):

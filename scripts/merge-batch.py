@@ -69,7 +69,8 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--filepath', type=str, help="Filepath to template data.")
+    parser.add_argument('--filepath', type=str, required=True,
+        help="Filepath to template data.")
     parser.add_argument('--batch_dir', type=str, help="Filepath to directory of batches",
         default='./output')
     parser.add_argument('-n', '--nbatches', type=int, default=None, help="Limit size.")

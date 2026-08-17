@@ -13,9 +13,13 @@
 
 set -euo pipefail
 
-OUT="${1:-demo-output}"
 PY="${PYTHON:-python}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve the output path against the CALLER's directory before changing to the
+# repo root, so `bash /path/to/scripts/demo.sh out` puts `out` where the caller
+# expects rather than inside the checkout.
+OUT="${1:-$HERE/demo-output}"
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 cd "$HERE"
 
 if ! "$PY" -c 'import pandas, spacy, symspellpy, thefuzz, pyzipcode' 2>/dev/null; then

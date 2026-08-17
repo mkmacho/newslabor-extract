@@ -291,7 +291,7 @@ def multithreading(func, addrs, geo, max_workers:int=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--filepath', type=str, help="Filepath to extract output, e.g. ./output/NJG-extract-all.gzip")
+    parser.add_argument('--filepath', type=str, required=True, help="Filepath to extract output, e.g. ./output/NJG-extract-all.gzip")
     parser.add_argument('-n', '--nrows', type=int, default=None, help="Maximum number of ads.")
     parser.add_argument('-s', '--skip', type=int, default=0, help="Ads to skip at beginning.")
     # type=int, not type=bool: bool("0") is True, so '--multithreading=0' used to
