@@ -1,4 +1,4 @@
-pandas==1.5.3
+pandas==3.0.5
 spacy==3.7.4
 thefuzz==0.22.1
 pyzipcode==3.0.1
